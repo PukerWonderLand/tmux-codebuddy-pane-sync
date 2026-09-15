@@ -53,6 +53,8 @@ python3 tmux_codebuddy_pane_sync.py --apply
 
 hook 由 `install.sh` 追加到 `~/.codebuddy/settings.json`，**不会改动或删除**你已有的 hook 条目（例如计费/归档用的 `codebuddy_turn_hook.py`）。卸载时会原样移除，只留下你自己的条目。
 
+> **CodeBuddy 只在启动时读取一次 hooks 快照。** 因此改动 `settings.json` 之后，正在运行的会话仍会用旧快照：在新会话里生效，或者用 `/hooks` 菜单审阅后应用。已经开着的会话由 timer 兜底。hook 命令不向 stdout 写任何内容——`UserPromptSubmit` 的 stdout 会被当作上下文加入对话。
+
 ## 同步规则
 
 1. 发现当前用户的 tmux sockets，遍历其中所有 session/window/pane。

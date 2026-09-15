@@ -62,6 +62,12 @@ python3 tmux_codebuddy_pane_sync.py --apply
 removes** hooks you already have (such as a usage/archive hook). Uninstall removes
 exactly what it added.
 
+> **CodeBuddy snapshots hooks at startup.** After `settings.json` changes, sessions
+> that are already running keep the old snapshot: the hooks apply in a new session,
+> or after reviewing them in the `/hooks` menu. The timer covers the gap for running
+> sessions. The hook writes nothing to stdout — `UserPromptSubmit` stdout is added to
+> the conversation as context.
+
 ## Sync rules
 
 1. Discover the current user's tmux sockets and walk every session/window/pane.
