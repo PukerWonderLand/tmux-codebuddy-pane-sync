@@ -4,6 +4,8 @@
 
 **把 CodeBuddy 对话名同步为 tmux pane 标题，每 30 分钟先备份、再比较、再更新，并在每轮对话结束时立即同步一次。**
 
+同时记录**每个 pane 当前打开的是哪个对话**，机器重启后自动把 tmux 的 session/window/pane 重建出来，并在每个 pane 里 `workbuddy -r <会话 id>` 恢复**原来那个对话**（不是新开一个）。
+
 适合同时打开多个 CodeBuddy CLI 的用户：pane 不再只有一个笼统的名字，而是“公司法了解”“全球同步-Windterm”等可读的对话名。
 
 ```
@@ -55,10 +57,54 @@ hook 由 `install.sh` 追加到 `~/.codebuddy/settings.json`，**不会改动或
 
 > **CodeBuddy 只在启动时读取一次 hooks 快照。** 因此改动 `settings.json` 之后，正在运行的会话仍会用旧快照：在新会话里生效，或者用 `/hooks` 菜单审阅后应用。已经开着的会话由 timer 兜底。hook 命令不向 stdout 写任何内容——`UserPromptSubmit` 的 stdout 会被当作上下文加入对话。
 
+## 重启后自动恢复对话
+
+每次完整扫描都会把「哪个 pane 打开哪个对话」写进
+`~/.local/state/tmux-codebuddy-pane-sync/restore-manifest.json`：
+
+```json
+{"version": 1, "captured_at": "2026-09-21T15:21:20+08:00",
+ "panes": [{"session": "deepseek4_1_work5", "window_order": 0, "pane_order": 2,
+            "cwd": "/home/codex", "session_id": "01a09eb5-f596-7494-...",
+            "session_id_source": "endpoint", "title": "TMU的pane自动更新"}]}
+```
+
+重启后由 `tmux-codebuddy-pane-sync-restore.service`（`WantedBy=default.target`，你的 `Linger=yes`
+所以无需登录）执行：起 tmux server → 按 manifest 重建缺失的 session/window/pane → 逐 pane 检查
+**是否已经跑着 CodeBuddy**（有就跳过，绝不打扰）→ `tmux send-keys "cd <cwd> && workbuddy -r <id>"`。
+
+```
+# 先看计划，什么都不改
+codebuddy_restore.py --dry-run
+
+# 真正恢复（正常由开机服务调用）
+codebuddy_restore.py --apply
+
+# 只恢复某几个 tmux session，便于小范围验证
+codebuddy_restore.py --apply --only-tmux-session deepseek4_1_work5
+```
+
+顺序与安全保证：
+
+- **幂等**：已经在跑 CodeBuddy 的 pane 一律跳过，所以重跑服务、或你已手动开过都不会重复启动。
+- **同一对话只恢复一次**：manifest 里同一 `session_id` 出现多次时只处理第一条。
+- **只创建缺的**：缺 window 才建 window，缺 pane 才 split；新建的 session 会复用 `new-session`
+  自带的首个 pane，不会多切一个。
+- **重启后校验**：`--verify-seconds`（默认 5 秒）内没在 pane 里看到 CodeBuddy 就记
+  `launch_unverified`，而不是假装成功。日志在
+  `~/.local/state/tmux-codebuddy-pane-sync/restore-log.jsonl`。
+- 用户目录已不存在 → `missing_cwd` 跳过；`--stagger-seconds`（默认 3 秒）避免开机瞬间同时拉起十几个 CLI。
+
+后台任务（`codebuddy ps` 里的 `kind=bg`）不在 pane 内，本工具不处理；官方有
+`codebuddy respawn <idOrName>` 可以在保留对话的前提下重启它们。
+
 ## 同步规则
 
 1. 发现当前用户的 tmux sockets，遍历其中所有 session/window/pane。
-2. 用 pane 的 PID 与子进程树，找到其中运行 CodeBuddy 的进程，并由 `~/.codebuddy/sessions/<pid>.json` 读出对话 ID。
+2. 用 pane 的 PID 与子进程树找到运行 CodeBuddy 的进程，再问**进程自己的本地端点**
+   `GET http://127.0.0.1:<port>/api/v1/sessions/live` 拿它当前显示的对话 ID
+   （端口取自 `~/.codebuddy/sessions/<pid>.json` 的 `url`；请求头 `X-CodeBuddy-Request: 1`
+   是文档写明的 CSRF 防护，不是密钥）。
 3. 只读该对话的 transcript，取最后一次 `custom-title`（没有则取 `ai-title`）。
 4. **先把所有 pane 的原标题、对话名和身份信息写入日志并刷到磁盘。**
 5. 比较两个名字；一致就记录 `unchanged`，不一致才更新。
@@ -76,11 +122,15 @@ hook 由 `install.sh` 追加到 `~/.codebuddy/settings.json`，**不会改动或
 | 内容 | 默认位置 |
 |---|---|
 | 已安装脚本 | `~/.local/bin/tmux-codebuddy-pane-sync.py` |
+| 恢复脚本 | `~/.local/bin/codebuddy_restore.py` |
 | CodeBuddy hook | `~/.codebuddy/hooks/codebuddy_pane_sync_hook.py` |
 | 配置 | `~/.config/tmux-codebuddy-pane-sync/config.json` |
 | 备份与结果日志 | `~/.local/state/tmux-codebuddy-pane-sync/pane-names.jsonl` |
+| 恢复清单 | `~/.local/state/tmux-codebuddy-pane-sync/restore-manifest.json` |
+| 恢复日志 | `~/.local/state/tmux-codebuddy-pane-sync/restore-log.jsonl` |
 | 旧版安装备份 | `~/.local/state/tmux-codebuddy-pane-sync/install-backups/` |
 | systemd 单元 | `~/.config/systemd/user/tmux-codebuddy-pane-sync.{service,timer}` |
+| 开机恢复单元 | `~/.config/systemd/user/tmux-codebuddy-pane-sync-restore.service` |
 
 日志采用 JSONL，每行一条 JSON，包含时间、运行 ID、socket、session、pane ID、CodeBuddy 对话 ID、原标题、对话名和结果。`backup` 记录先于本轮任何改名，`result` 记录实际处理结果。首次创建日志权限为 `0600`。
 
@@ -120,7 +170,16 @@ systemctl --user start tmux-codebuddy-pane-sync.service
 
 # 非标准 tmux -S socket：只处理明确指定的服务端，可重复传入
 ./install.sh --socket /path/to/tmux.sock --socket /another/tmux.sock
+
+# 不安装开机恢复服务（只做标题同步）
+./install.sh --no-restore
+
+# 指定恢复时用的启动器与开机启动间隔
+./install.sh --workbuddy-command /home/codex/.local/bin/workbuddy --stagger-seconds 3
 ```
+
+恢复相关配置写在同一个 `config.json`：`workbuddy_command`、`stagger_seconds`、`verify_seconds`、
+`restore`（是否安装开机服务）、`manifest`（清单路径）。
 
 没有显式 socket 时，发现 `/tmp/tmux-UID/*`、当前进程 `TMUX_TMPDIR` 下的 sockets 及 `TMUX` 指向的 socket。systemd 不一定继承交互 shell 的环境；非标准位置请使用 `--socket` 固化配置。只处理当前用户拥有的 socket。
 
@@ -147,7 +206,10 @@ systemctl --user disable --now tmux-codebuddy-pane-sync.timer
 # 恢复
 systemctl --user enable --now tmux-codebuddy-pane-sync.timer
 
-# 完全卸载脚本、hook 和 systemd 单元；保留日志和配置
+# 只看开机恢复服务是否已启用
+systemctl --user is-enabled tmux-codebuddy-pane-sync-restore.service
+
+# 完全卸载脚本、hook、恢复服务和 systemd 单元；保留日志和配置
 ./uninstall.sh
 ```
 
@@ -173,6 +235,19 @@ git pull --ff-only
 - 本机 tmux 3.2a 没有 `allow-set-title`，本项目不依赖该选项。
 - 只扫描当前用户拥有且可访问的 tmux 服务端；不会扫描其他用户或远程主机。
 - 与 `tmux-codex-pane-sync` 完全独立：不同的 App 名、配置目录、日志和 systemd 单元，可同时安装。
+
+恢复相关的边界：
+
+- **布局只记「顺序」，不记 tmux 下标。** 实测 tmux 的 `window_index`/`pane_index` 会随增删窗口和 pane
+  漂移（几分钟内就从 `6/13` 变成 `0/0`），所以 manifest 记录的是窗口在 session 内的序号、以及 pane 在
+  窗口内的序号。恢复出来的下标可能与原来不同，但窗口数、每个窗口的 pane 数和**哪个对话在哪个位置**一致。
+- `/api/v1/sessions/live` 官方标注 **Beta**，字段可能调整；端点不可达时会退回
+  `sessions/<pid>.json`（该文件在 `/resume` 之后会指向旧会话，所以端点才是权威）。
+- **必须先记录再重启**：端口是进程本地的，重启后端口必然变化，无法事后补查。清单每 30 分钟和每轮对话
+  结束都会刷新。
+- `kind=bg` 的后台任务不在 pane 内，不参与恢复（用 `codebuddy respawn`）。
+- 恢复会真实地在 pane 里执行 `workbuddy -r <id>`：如果清单里的 cwd 已删除会跳过（`missing_cwd`），
+  已经跑着 CodeBuddy 的 pane 一律不碰。
 
 ## 开发与测试
 

@@ -5,6 +5,10 @@
 **Sync CodeBuddy conversation names to tmux pane titles: back up first, compare, then
 update — every 30 minutes, plus once at the end of every turn.**
 
+It also records **which conversation each pane has open**, so after a reboot the tmux
+sessions, windows and panes are rebuilt and every pane runs
+`workbuddy -r <session-id>` to bring back the *same* conversation rather than a new one.
+
 Built for people running several CodeBuddy CLI sessions at once, so panes read
 `公司法了解` or `全球同步-Windterm` instead of an interchangeable label.
 
@@ -68,11 +72,45 @@ exactly what it added.
 > sessions. The hook writes nothing to stdout — `UserPromptSubmit` stdout is added to
 > the conversation as context.
 
+## Restoring conversations after a reboot
+
+Every full sweep writes "which pane holds which conversation" to
+`~/.local/state/tmux-codebuddy-pane-sync/restore-manifest.json`. After a reboot
+`tmux-codebuddy-pane-sync-restore.service` (`WantedBy=default.target`; your `Linger=yes`
+means no login is needed) starts the tmux server, rebuilds the missing
+sessions/windows/panes, and for each pane checks **whether CodeBuddy already runs there**
+(skip if so, never interrupt) before sending
+`tmux send-keys "cd <cwd> && workbuddy -r <id>"`.
+
+```
+codebuddy_restore.py --dry-run                                    # plan only, changes nothing
+codebuddy_restore.py --apply                                      # what the boot service runs
+codebuddy_restore.py --apply --only-tmux-session deepseek4_1_work5 # narrow test
+```
+
+Safety properties:
+
+- **Idempotent**: a pane already running CodeBuddy is skipped, so re-running the service or
+  having started something by hand never double-launches.
+- **One writer per conversation**: a repeated `session_id` in the manifest is restored once.
+- **Creates only what is missing**: windows and panes are added only up to the recorded
+  layout; a fresh session reuses the pane `new-session` already made.
+- **Verified**: `--verify-seconds` (default 5) polls for CodeBuddy in the pane and records
+  `launch_unverified` instead of claiming success. Log:
+  `~/.local/state/tmux-codebuddy-pane-sync/restore-log.jsonl`.
+- A deleted working directory is skipped (`missing_cwd`); `--stagger-seconds` (default 3)
+  avoids starting a dozen CLIs at once at boot.
+
+Background sessions (`kind=bg` in `codebuddy ps`) do not live in panes and are not restored;
+use the official `codebuddy respawn <idOrName>` for those.
+
 ## Sync rules
 
 1. Discover the current user's tmux sockets and walk every session/window/pane.
-2. Map each pane to the CodeBuddy process in its subtree and read the conversation
-   id from `~/.codebuddy/sessions/<pid>.json`.
+2. Map each pane to the CodeBuddy process in its subtree and ask **that process's own
+   loopback API** — `GET http://127.0.0.1:<port>/api/v1/sessions/live` — which conversation
+   it is showing (the port comes from `url` in `~/.codebuddy/sessions/<pid>.json`; the
+   `X-CodeBuddy-Request: 1` header is a documented CSRF guard, not a secret).
 3. Read that conversation's transcript and take the last `custom-title` (falling
    back to `ai-title`).
 4. **Write every pane's original title, conversation name and identity to the
@@ -99,11 +137,15 @@ overridden at install time.
 | Item | Default path |
 |---|---|
 | Installed script | `~/.local/bin/tmux-codebuddy-pane-sync.py` |
+| Restore script | `~/.local/bin/codebuddy_restore.py` |
 | CodeBuddy hook | `~/.codebuddy/hooks/codebuddy_pane_sync_hook.py` |
 | Configuration | `~/.config/tmux-codebuddy-pane-sync/config.json` |
 | Backup and result log | `~/.local/state/tmux-codebuddy-pane-sync/pane-names.jsonl` |
+| Restore manifest | `~/.local/state/tmux-codebuddy-pane-sync/restore-manifest.json` |
+| Restore log | `~/.local/state/tmux-codebuddy-pane-sync/restore-log.jsonl` |
 | Previous install backups | `~/.local/state/tmux-codebuddy-pane-sync/install-backups/` |
 | systemd units | `~/.config/systemd/user/tmux-codebuddy-pane-sync.{service,timer}` |
+| Boot restore unit | `~/.config/systemd/user/tmux-codebuddy-pane-sync-restore.service` |
 
 The log is JSONL, one JSON object per line, with time, run id, socket, session,
 pane id, CodeBuddy conversation id, previous title, conversation name and result.
@@ -139,6 +181,8 @@ or deleted automatically.
 ./install.sh --name-source ai        # auto (default) / custom / ai
 ./install.sh --no-hook               # timer only; settings.json untouched
 ./install.sh --socket /path/to/tmux.sock --socket /another/tmux.sock
+./install.sh --no-restore                                            # titles only
+./install.sh --workbuddy-command /home/codex/.local/bin/workbuddy --stagger-seconds 3
 ```
 
 Without explicit sockets, the tool discovers `/tmp/tmux-UID/*`, sockets under
@@ -210,6 +254,23 @@ is left alone, and reinstalling is idempotent.
 - Only tmux servers owned and reachable by the current user are scanned.
 - Fully independent of `tmux-codex-pane-sync`: different app name, config
   directory, journal and systemd units, so both can be installed at once.
+
+About restoring:
+
+- **The layout is recorded as order, not as tmux indexes.** Measured: `window_index` and
+  `pane_index` drift as windows and panes come and go (`6/13` became `0/0` within minutes),
+  so the manifest stores each window's position in its session and each pane's position in
+  its window. Restored indexes may differ, but the window count, the pane count per window,
+  and which conversation sits where are preserved.
+- `/api/v1/sessions/live` is marked **Beta** upstream and its fields may change; if the
+  endpoint is unreachable the tool falls back to `sessions/<pid>.json` (which points at the
+  wrong session after a `/resume`, which is why the endpoint is authoritative).
+- **Record before you reboot**: the endpoint port is per-process, so it necessarily changes
+  across a reboot and cannot be queried afterwards. The manifest is refreshed every 30
+  minutes and at the end of every turn.
+- `kind=bg` background sessions live outside panes and are not restored.
+- A restore really types `workbuddy -r <id>` into panes: a missing cwd is skipped
+  (`missing_cwd`) and a pane already running CodeBuddy is never touched.
 
 ## Development
 

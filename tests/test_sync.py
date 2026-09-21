@@ -587,3 +587,145 @@ class TestEndToEnd(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestPaneOrdinals(unittest.TestCase):
+    """Layout position, not tmux index, is what survives a reboot."""
+
+    def test_orders_windows_and_panes_with_gaps(self):
+        rows = [dict(session_id='$1', pane_id='%a', window_index=6, pane_index=13),
+                dict(session_id='$1', pane_id='%b', window_index=6, pane_index=19),
+                dict(session_id='$1', pane_id='%c', window_index=15, pane_index=37),
+                dict(session_id='$2', pane_id='%d', window_index=0, pane_index=0)]
+        self.assertEqual(sync.pane_ordinals(rows),
+                         {'%a': (0, 0), '%b': (0, 1), '%c': (1, 0), '%d': (0, 0)})
+
+    def test_renumbering_does_not_change_the_ordinals(self):
+        def rows(offset):
+            return [dict(session_id='$1', pane_id='%a', window_index=0 + offset, pane_index=0 + offset),
+                    dict(session_id='$1', pane_id='%b', window_index=0 + offset, pane_index=1 + offset)]
+        self.assertEqual(sync.pane_ordinals(rows(0)), sync.pane_ordinals(rows(6)))
+
+    def test_sessions_are_counted_separately(self):
+        rows = [dict(session_id='$1', pane_id='%a', window_index=0, pane_index=0),
+                dict(session_id='$2', pane_id='%b', window_index=0, pane_index=0)]
+        self.assertEqual(sync.pane_ordinals(rows), {'%a': (0, 0), '%b': (0, 0)})
+
+
+class TestLiveEndpoint(SessionsTestCase):
+    """The process's own loopback API outranks the pid file after a /resume."""
+
+    def setUp(self):
+        super().setUp()
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            payload = {'data': {'sessionId': 'live-id', 'writerOccupied': False}}
+            status = 200
+
+            def do_GET(self):
+                body = json.dumps(Handler.payload).encode('utf-8')
+                self.send_response(Handler.status)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.handler = Handler
+        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f'http://127.0.0.1:{self.server.server_address[1]}'
+        self.sessions = sync.Sessions(self.home)
+
+    def test_reads_the_session_id_from_the_endpoint(self):
+        self.assertEqual(self.sessions.live_session(self.url), 'live-id')
+
+    def test_a_refused_port_returns_none(self):
+        self.server.shutdown()
+        self.assertIsNone(self.sessions.live_session(self.url))
+
+    def test_a_non_loopback_url_is_never_contacted(self):
+        self.assertIsNone(self.sessions.live_session('http://10.11.12.13:1'))
+
+    def test_a_malformed_reply_returns_none(self):
+        self.handler.payload = {'unexpected': True}
+        self.assertIsNone(self.sessions.live_session(self.url))
+
+    def test_a_non_json_reply_returns_none(self):
+        self.handler.payload = None
+        self.assertIsNone(self.sessions.live_session(self.url))
+
+    def record(self, pid, session_id, url):
+        (self.home / 'sessions' / f'{pid}.json').write_text(json.dumps(
+            {'pid': pid, 'sessionId': session_id, 'cwd': '/home/codex', 'kind': 'interactive',
+             'url': url}), encoding='utf-8')
+
+    def tree(self):
+        return {10: (1, '1'), 11: (10, '2')}
+
+    def test_the_endpoint_outranks_a_stale_pid_file(self):
+        for session_id, name in (('live-id', 'The one on screen'), ('stale-id', 'The abandoned one')):
+            write_jsonl(self.home / 'projects' / 'home-codex' / f'{session_id}.jsonl',
+                        [{'type': 'custom-title', 'customTitle': name}])
+        with mock.patch.object(sync.Sessions, 'is_codebuddy', staticmethod(lambda pid: pid == 11)):
+            self.record(11, 'stale-id', self.url)
+            info, reason = self.sessions.inspect(10, self.tree())
+        self.assertIsNone(reason)
+        self.assertEqual(info['session_id'], 'live-id')
+        self.assertEqual(info['name'], 'The one on screen')
+        self.assertEqual(info['pid_file_session_id'], 'stale-id')
+        self.assertEqual(info['session_id_source'], 'endpoint')
+
+    def test_the_pid_file_is_used_when_the_endpoint_is_silent(self):
+        write_jsonl(self.home / 'projects' / 'home-codex' / 'pid-file-id.jsonl',
+                    [{'type': 'custom-title', 'customTitle': 'From the pid file'}])
+        with mock.patch.object(sync.Sessions, 'is_codebuddy', staticmethod(lambda pid: pid == 11)):
+            self.record(11, 'pid-file-id', 'http://127.0.0.1:9')
+            info, reason = self.sessions.inspect(10, self.tree())
+        self.assertIsNone(reason)
+        self.assertEqual(info['session_id'], 'pid-file-id')
+        self.assertEqual(info['session_id_source'], 'pid_file')
+
+    def test_a_scoped_run_still_resolves_through_the_endpoint(self):
+        """--only-session filters on the resolved id, so it must be the live one."""
+        with mock.patch.object(sync.Sessions, 'is_codebuddy', staticmethod(lambda pid: pid == 11)):
+            self.record(11, 'stale-id', self.url)
+            info, _ = self.sessions.inspect(10, self.tree())
+        self.assertIn(info['session_id'], {'live-id'})
+
+
+class TestTitleDisambiguation(SessionsTestCase):
+    """Two CodeBuddy processes under one pane are separated by the rendered title."""
+
+    TREE = {10: (1, '1'), 11: (10, '2'), 12: (10, '3')}
+
+    def setUp(self):
+        super().setUp()
+        self.sessions = sync.Sessions(self.home)
+        for pid, session_id, name in ((11, 'sid-a', 'First conversation'),
+                                      (12, 'sid-b', 'Second conversation')):
+            (self.home / 'sessions' / f'{pid}.json').write_text(json.dumps(
+                {'pid': pid, 'sessionId': session_id, 'cwd': '/home/codex',
+                 'kind': 'interactive'}), encoding='utf-8')
+            write_jsonl(self.home / 'projects' / 'home-codex' / f'{session_id}.jsonl',
+                        [{'type': 'custom-title', 'customTitle': name}])
+
+    def test_the_matching_title_picks_the_process(self):
+        with mock.patch.object(sync.Sessions, 'is_codebuddy',
+                               staticmethod(lambda pid: pid in (11, 12))):
+            info, reason = self.sessions.inspect(10, self.TREE, '✳ Second conversation')
+        self.assertIsNone(reason)
+        self.assertEqual(info['session_id'], 'sid-b')
+
+    def test_an_unhelpful_title_stays_ambiguous(self):
+        with mock.patch.object(sync.Sessions, 'is_codebuddy',
+                               staticmethod(lambda pid: pid in (11, 12))):
+            info, reason = self.sessions.inspect(10, self.TREE, 'something else')
+        self.assertIsNone(info)
+        self.assertEqual(reason, 'ambiguous_sessions')

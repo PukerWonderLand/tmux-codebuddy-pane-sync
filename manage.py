@@ -155,8 +155,10 @@ class Layout:
         self.config_file = self.config_dir / 'config.json'
         self.units = self.config_root / 'systemd/user'
         self.script = home / '.local/bin/tmux-codebuddy-pane-sync.py'
+        self.restore_script = home / '.local/bin/codebuddy_restore.py'
         self.service = self.units / f'{APP}.service'
         self.timer = self.units / f'{APP}.timer'
+        self.restore_service = self.units / f'{APP}-restore.service'
         self.codebuddy_home = Path(codebuddy_home or config.get('codebuddy_home')
                                   or os.environ.get('CODEBUDDY_HOME')
                                   or home / '.codebuddy').expanduser().resolve()
@@ -183,7 +185,10 @@ def uninstall(layout, no_start):
         backup([layout.settings], layout.state_dir)
         write_json(layout.settings, settings, layout.settings.stat().st_mode & 0o777)
         print(f'Removed CodeBuddy hooks from {layout.settings}')
-    for path in (layout.script, layout.hook, layout.service, layout.timer):
+    if not no_start:
+        systemctl('disable', '--now', f'{APP}-restore.service', quiet=True)
+    for path in (layout.script, layout.hook, layout.service, layout.timer,
+                 layout.restore_script, layout.restore_service):
         path.unlink(missing_ok=True)
     if not no_start:
         systemctl('daemon-reload')
@@ -203,6 +208,8 @@ def install(args, layout):
     config['state_dir'] = str(layout.state_dir)
     config['interval_minutes'] = args.interval_minutes or config.get('interval_minutes', 30)
     config['name_source'] = args.name_source or config.get('name_source', 'auto')
+    if args.workbuddy_command:
+        config['workbuddy_command'] = args.workbuddy_command
     if args.socket is not None:
         config['sockets'] = [str(Path(p).expanduser().resolve()) for p in args.socket]
     else:
@@ -210,12 +217,19 @@ def install(args, layout):
     if not isinstance(config['interval_minutes'], int) or config['interval_minutes'] < 1:
         raise SystemExit('Invalid interval in config.json')
     config['hooks'] = not args.no_hook
+    config['restore'] = not args.no_restore
+    if args.stagger_seconds is not None:
+        if args.stagger_seconds < 0:
+            raise SystemExit('--stagger-seconds must not be negative')
+        config['stagger_seconds'] = args.stagger_seconds
+    config.setdefault('stagger_seconds', 3)
     os.umask(0o077)
     for directory in (layout.config_dir, layout.units, layout.script.parent,
                       layout.state_dir, layout.hook.parent):
         directory.mkdir(parents=True, exist_ok=True)
     previous = backup([layout.script, layout.service, layout.timer, layout.config_file,
-                       layout.hook], layout.state_dir)
+                       layout.hook, layout.restore_script, layout.restore_service],
+                      layout.state_dir)
     if previous:
         print(f'Previous installation backed up: {previous}')
     if not args.no_start:
@@ -226,6 +240,8 @@ def install(args, layout):
     layout.script.chmod(0o700)
     shutil.copyfile(ROOT / 'hooks' / HOOK_BASENAME, layout.hook)
     layout.hook.chmod(0o700)
+    shutil.copyfile(ROOT / 'codebuddy_restore.py', layout.restore_script)
+    layout.restore_script.chmod(0o700)
     write_json(layout.config_file, config)
     executable = str(Path(sys.executable).resolve())
     tmux_dir = str(Path(shutil.which('tmux')).parent)
@@ -242,6 +258,19 @@ def install(args, layout):
         '[Unit]\nDescription=Periodically back up and synchronize tmux pane names\n\n'
         f'[Timer]\nOnActiveSec={interval}min\nOnUnitActiveSec={interval}min\n'
         f'AccuracySec=1s\nUnit={APP}.service\n\n[Install]\nWantedBy=timers.target\n')
+    if not config['restore']:
+        layout.restore_service.unlink(missing_ok=True)
+    layout.restore_service.write_text(
+        '[Unit]\nDescription=Restore tmux panes and resume their CodeBuddy conversations\n'
+        'After=network-online.target\nWants=network-online.target\n\n'
+        '[Service]\nType=oneshot\n'
+        f'Environment={quote("PATH=" + search_path)}\n'
+        # Give the network and the user manager a moment before starting a dozen CLIs.
+        'ExecStartPre=/bin/sleep 20\n'
+        f'ExecStart={quote(executable)} {quote(layout.restore_script)}'
+        f' --config {quote(layout.config_file)} --apply --quiet\n'
+        'TimeoutStartSec=30min\nUMask=0077\n\n'
+        '[Install]\nWantedBy=default.target\n') if config['restore'] else None
     if config['hooks']:
         settings = load_settings(layout.settings)
         command = hook_command(layout.hook, executable)
@@ -257,12 +286,22 @@ def install(args, layout):
     if not args.no_start:
         systemctl('daemon-reload')
         systemctl('enable', '--now', f'{APP}.timer')
+        if config['restore']:
+            # Enabled, not started: a restore only belongs at boot, and running
+            # it now could launch conversations the user did not ask for.
+            systemctl('enable', f'{APP}-restore.service', check=False)
+        else:
+            systemctl('disable', f'{APP}-restore.service', check=False, quiet=True)
         if systemctl('start', f'{APP}.service', check=False).returncode:
             print(f'Timer installed, but initial sync failed. Inspect: journalctl --user -u {APP}.service',
                   file=sys.stderr)
         systemctl('list-timers', f'{APP}.timer', '--no-pager')
     print(f'Script: {layout.script}\nHook: {layout.hook}\nConfig: {layout.config_file}\n'
           f'Log: {layout.state_dir / "pane-names.jsonl"}\nInterval: {interval} minutes')
+    print(f'Manifest: {layout.state_dir / "restore-manifest.json"}')
+    if config['restore']:
+        print(f'Boot restore: {layout.restore_service} (enabled; test with '
+              f'"{layout.restore_script} --dry-run")')
 
 
 def main():
@@ -273,8 +312,14 @@ def main():
     parser.add_argument('--state-dir', type=Path)
     parser.add_argument('--socket', action='append')
     parser.add_argument('--name-source', choices=('auto', 'custom', 'ai'))
+    parser.add_argument('--workbuddy-command',
+                        help='Launcher the restore service should resume conversations with')
+    parser.add_argument('--stagger-seconds', type=int,
+                        help='Delay between boot-time launches (default 3)')
     parser.add_argument('--no-hook', action='store_true',
                         help='Do not register CodeBuddy hooks; timer only')
+    parser.add_argument('--no-restore', action='store_true',
+                        help='Do not install the boot-time restore service')
     parser.add_argument('--no-start', action='store_true', help='Only manage files, do not call systemd')
     args = parser.parse_args()
     if sys.platform != 'linux' or sys.version_info < (3, 9):

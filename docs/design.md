@@ -93,6 +93,50 @@ CodeBuddy **只在启动时对 hooks 取一次快照**，所以刚刚修改 `set
 这些检查缩小了竞态窗口，但 tmux、CodeBuddy 和 transcript 之间没有跨进程事务：检查结束到真正
 写入之间仍可能有状态变化。日志可用于追踪，下一轮会重新匹配。
 
+## 怎么确定「这个 pane 打开的是哪个对话」
+
+三种来源，可信度从高到低：
+
+| 来源 | 为什么可信 / 为什么不可信 |
+|---|---|
+| `GET <url>/api/v1/sessions/live` | **权威**：进程自己回答「我现在显示哪个会话」。实测 16/16 命中，并纠正了 4 个已过期的 pid 文件。只读、无按键、无 token、不写 transcript。 |
+| `~/.codebuddy/sessions/<pid>.json` 的 `sessionId` | 快，但**在 `/resume` 之后会指向进程启动时创建的那个（通常是空的）会话**。实测 pane `%35`：进程 11:41:31 启动、pid 文件写 `01a0b29a-f02f`，而屏上是被 resume 的 `01a09eb5`。 |
+| pane 标题 → 名字索引反查 | 只对**进程已死**的 pane 有意义（标题还在、进程没了）；要求唯一匹配，否则不猜。 |
+
+`CodeBuddy` **不持有 transcript 句柄**，所以 Codex 版那套 `/proc/PID/fd` 扫描在 CodeBuddy 上永远只能
+得到空结果；这一点必须先验证再设计。
+
+## 布局为什么必须记「序号」而不是 tmux 下标
+
+第一版 manifest 记录 `#{window_index}` 和 `#{pane_index}`，几分钟后同一批 pane 的 ID 没变（仍是
+`%13/%19/%39`），但下标从 `6/13` 变成了 `0/0` —— tmux 在增删窗口和 pane 时会重编号。以绝对下标做键，
+重启后必然对不上。
+
+所以 manifest 记录的是**相对位置**：窗口在 session 内的序号、pane 在窗口内的序号。
+恢复时按序号补齐缺的窗口/pane，只创建缺的部分：
+
+- 新 session 会复用 `new-session` 自带的第一个 pane（否则同一对话会在两个 pane 里各起一次 —— 这个是
+  实测踩到过的 bug）。
+- 已有足够 pane 就直接复用；不足才 `split-window`，多一个都不切。
+- 已在跑 CodeBuddy 的 pane 一律 `already_running` 跳过，所以重复执行是幂等的。
+
+## 重启恢复的执行链
+
+```mermaid
+flowchart TD
+  A[Linger=yes，开机后 systemd 用户实例起来] --> B[tmux-codebuddy-pane-sync-restore.service]
+  B --> C[sleep 20：等网络与用户管理器]
+  C --> D[tmux start-server]
+  D --> E[读 restore-manifest.json]
+  E --> F{按 session 分组，按序号补齐 window/pane}
+  F --> G{pane 里已有 CodeBuddy?}
+  G -- 有 --> H[already_running，不改动]
+  G -- 无 --> I[send-keys: cd cwd && workbuddy -r session_id]
+  I --> J[轮询 verify_seconds 确认真的起来了]
+  J --> K[launched / launch_unverified]
+  J --> L[stagger_seconds 后处理下一个]
+```
+
 ## 日志事件
 
 | event/status | 含义 |
@@ -117,6 +161,22 @@ CodeBuddy **只在启动时对 hooks 取一次快照**，所以刚刚修改 `set
 | `socket_error` | 某个 tmux 服务端不可用 |
 | `run_error` | 本轮异常终止 |
 | `run_end` | 本轮结束，包含 socket 数、pane 数和各状态计数 |
+| `manifest` | 刷新恢复清单，含条数、是否限定会话 |
+
+恢复日志（`restore-log.jsonl`）的事件：
+
+| event/status | 含义 |
+|---|---|
+| `run_start` / `run_end` | 本轮恢复开始/结束与计数 |
+| `restore / launched` | 已发出 `-r` 且轮询确认 CodeBuddy 真的起来了 |
+| `restore / launch_unverified` | 已发出命令，但超时没看到 CodeBuddy |
+| `restore / already_running` | 该 pane 已有 CodeBuddy，跳过（幂等的关键） |
+| `restore / would_launch` `would_create_and_launch` | 预览模式的计划 |
+| `restore / duplicate_session_id` | 同一对话已被处理过，不重复启动 |
+| `restore / missing_cwd` | 记录的工作目录已不存在 |
+| `restore / malformed_entry` | 清单条目缺字段 |
+| `restore / error` | 调用 tmux 失败 |
+| `no_manifest` / `launcher_not_found` / `server_unavailable` | 无清单 / 找不到启动器 / 起不了 tmux |
 
 ## 配置与路径
 

@@ -13,9 +13,19 @@ import stat
 import subprocess
 import sys
 import uuid
+from urllib.parse import urlsplit
+import urllib.request
 
-VERSION = '0.1.0'
+VERSION = '0.2.0'
 APP = 'tmux-codebuddy-pane-sync'
+MANIFEST_NAME = 'restore-manifest.json'
+
+# The process's own loopback API answers with the session it is *currently*
+# showing, which the pid file does not after a /resume. The request header is a
+# CSRF guard documented as a fixed value, not a secret.
+ENDPOINT_HEADER = {'X-CodeBuddy-Request': '1'}
+ENDPOINT_TIMEOUT = 2
+LOOPBACK_HOSTS = ('127.0.0.1', 'localhost', '::1')
 
 # CodeBuddy prints a spinner/status glyph immediately before the title it writes
 # to the terminal. Those glyphs land in the pane title, so a literal comparison
@@ -90,11 +100,12 @@ class Sessions:
     nothing and must not be used here.
     """
 
-    def __init__(self, home, name_source='auto'):
+    def __init__(self, home, name_source='auto', endpoint_timeout=ENDPOINT_TIMEOUT):
         self.home = Path(home)
         self.sessions_dir = self.home / 'sessions'
         self.projects_dir = self.home / 'projects'
         self.name_source = name_source
+        self.endpoint_timeout = endpoint_timeout
 
     @staticmethod
     def is_codebuddy(pid):
@@ -105,18 +116,28 @@ class Sessions:
         return any(Path(os.fsdecode(a)).name in ('codebuddy', 'workbuddy')
                    for a in args if a)
 
-    def lookup(self, pid, tree):
-        """-> (record, skip_reason); exactly one running session may match."""
-        candidates = []
-        for child in sorted(descendants(pid, tree)):
-            record = self._record(child)
-            if record:
-                candidates.append(record)
-        if not candidates:
-            return None, 'no_codebuddy_session'
-        if len(candidates) > 1:
-            return None, 'ambiguous_sessions'
-        return candidates[0], None
+    def live_session(self, url):
+        """Ask the process itself which conversation it currently shows.
+
+        ``sessions/<pid>.json`` records the session created at startup, so after
+        a /resume it names the wrong (usually empty) conversation. The process's
+        own loopback API stays correct, and answering it costs one local GET:
+        no keystrokes, no tokens, no transcript writes.
+        """
+        if not isinstance(url, str) or not url:
+            return None
+        if urlsplit(url).hostname not in LOOPBACK_HOSTS:
+            return None
+        request = urllib.request.Request(f'{url.rstrip("/")}/api/v1/sessions/live',
+                                         headers=dict(ENDPOINT_HEADER))
+        try:
+            with urllib.request.urlopen(request, timeout=self.endpoint_timeout) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+        except (OSError, ValueError):
+            return None
+        data = payload.get('data') if isinstance(payload, dict) else None
+        value = data.get('sessionId') if isinstance(data, dict) else None
+        return value if isinstance(value, str) and value.strip() else None
 
     def _record(self, pid):
         if not self.is_codebuddy(pid):
@@ -127,14 +148,54 @@ class Sessions:
             return None
         if not isinstance(data, dict):
             return None
-        session_id = data.get('sessionId')
-        if not isinstance(session_id, str) or not session_id.strip():
+        pid_file_id = data.get('sessionId')
+        if not isinstance(pid_file_id, str) or not pid_file_id.strip():
             return None
         kind = data.get('kind')
         if isinstance(kind, str) and kind and kind != 'interactive':
             return None
-        return {'pid': pid, 'session_id': session_id, 'cwd': data.get('cwd'),
-                'last_heartbeat': data.get('lastHeartbeat')}
+        url = data.get('url') or data.get('endpoint')
+        live_id = self.live_session(url)
+        return {'pid': pid, 'session_id': live_id or pid_file_id,
+                'pid_file_session_id': pid_file_id, 'live_session_id': live_id,
+                'session_id_source': 'endpoint' if live_id else 'pid_file',
+                'url': url if isinstance(url, str) else None,
+                'cwd': data.get('cwd'), 'last_heartbeat': data.get('lastHeartbeat')}
+
+    def conversation_name(self, record):
+        path = self.transcript(record['session_id'], record.get('cwd'))
+        if not path:
+            return None
+        name, _used, reason = self.title(path)
+        return name if reason is None else None
+
+    def matches_title(self, record, pane_title):
+        """CodeBuddy renders the conversation name itself, so it can arbitrate."""
+        if not pane_title:
+            return False
+        name = self.conversation_name(record)
+        return bool(name) and strip_status(pane_title) == name
+
+    def lookup(self, pid, tree, pane_title=None):
+        """-> (record, skip_reason); exactly one running session may match."""
+        candidates = []
+        for child in sorted(descendants(pid, tree)):
+            record = self._record(child)
+            if record:
+                candidates.append(record)
+        if not candidates:
+            return None, 'no_codebuddy_session'
+        if len(candidates) == 1:
+            return candidates[0], None
+        # Several CodeBuddy processes under one pane: keep the endpoint-backed
+        # ones, then let the rendered title arbitrate. Never guess between two
+        # answers the process itself gave.
+        answered = [c for c in candidates if c['live_session_id']]
+        pool = answered or candidates
+        matched = [c for c in pool if self.matches_title(c, pane_title)]
+        if len(matched) == 1:
+            return matched[0], None
+        return None, 'ambiguous_sessions'
 
     def transcript(self, session_id, cwd):
         if isinstance(cwd, str) and cwd.strip():
@@ -182,9 +243,9 @@ class Sessions:
             return name, used, 'unsafe_chat_name'
         return name, used, None
 
-    def inspect(self, pid, tree):
+    def inspect(self, pid, tree, pane_title=None):
         """-> (info, skip_reason) for one pane's process subtree."""
-        record, reason = self.lookup(pid, tree)
+        record, reason = self.lookup(pid, tree, pane_title)
         if reason:
             return None, reason
         path = self.transcript(record['session_id'], record.get('cwd'))
@@ -212,19 +273,62 @@ class Journal:
         self.file.close()
 
 
+def pane_ordinals(rows):
+    """-> {pane_id: (window_order, pane_order)}.
+
+    ``window_index`` and ``pane_index`` are renumbered by tmux as windows and
+    panes come and go (observed drifting from 6/13 to 0/0 within minutes), so
+    they cannot identify anything across a reboot. Only the *relative* order of
+    windows within a session and panes within a window is a stable description
+    of the layout, and that is what a restore has to rebuild.
+    """
+    by_session = {}
+    for row in rows:
+        by_session.setdefault(row['session_id'], []).append(row)
+    result = {}
+    for members in by_session.values():
+        windows = sorted({row['window_index'] for row in members})
+        window_order = {index: order for order, index in enumerate(windows)}
+        grouped = {}
+        for row in members:
+            grouped.setdefault(row['window_index'], []).append(row)
+        for index, panes in grouped.items():
+            ordered = sorted(panes, key=lambda row: row['pane_index'])
+            for order, row in enumerate(ordered):
+                result[row['pane_id']] = (window_order[index], order)
+    return result
+
+
+def list_panes(socket):
+    """-> one dict per pane, with its layout position, from a single tmux call."""
+    lines = tmux(socket, 'list-panes', '-a', '-F',
+                 '#{session_id} #{window_id} #{pane_id} #{pane_pid} '
+                 '#{window_index} #{pane_index}').splitlines()
+    rows = []
+    for line in lines:
+        session_id, window_id, pane_id, pid, window, pane = line.split()
+        rows.append(dict(session_id=session_id, window_id=window_id, pane_id=pane_id,
+                         pane_pid=int(pid), window_index=int(window), pane_index=int(pane)))
+    return rows
+
+
 def snapshot(socket, sessions, tree, only_sessions=()):
     result = []
-    lines = tmux(socket, 'list-panes', '-a', '-F',
-                 '#{session_id} #{window_id} #{pane_id} #{pane_pid}').splitlines()
-    for line in lines:
-        session, window, pane, pid = line.split()
+    rows = list_panes(socket)
+    ordinals = pane_ordinals(rows)
+    for row in rows:
+        session, window, pane, pid = (row['session_id'], row['window_id'],
+                                      row['pane_id'], row['pane_pid'])
         target = f'{session}:{window}.{pane}'
         data = dict(socket=socket, session_id=session, window_id=window,
-                    pane_id=pane, pane_pid=int(pid))
+                    pane_id=pane, pane_pid=pid,
+                    window_index=row['window_index'], pane_index=row['pane_index'])
+        data['window_order'], data['pane_order'] = ordinals.get(pane, (None, None))
         try:
             data['session'] = tmux(socket, 'display-message', '-p', '-t', target, '#{session_name}')
             data['pane_title'] = tmux(socket, 'display-message', '-p', '-t', target, '#{pane_title}')
-            info, reason = sessions.inspect(int(pid), tree)
+            data['pane_cwd'] = tmux(socket, 'display-message', '-p', '-t', target, '#{pane_current_path}')
+            info, reason = sessions.inspect(pid, tree, data.get('pane_title'))
             # A scoped run records nothing at all for panes it was not asked
             # about, including panes that hold no session.
             if only_sessions and (not info or info['session_id'] not in only_sessions):
@@ -232,6 +336,8 @@ def snapshot(socket, sessions, tree, only_sessions=()):
             if info:
                 data.update(codebuddy_pid=info['pid'], codebuddy_session_id=info['session_id'],
                             codebuddy_chat_name=info.get('name'), chat_name_source=info.get('name_used'),
+                            conversation_id_source=info.get('session_id_source'),
+                            pid_file_session_id=info.get('pid_file_session_id'),
                             transcript=info.get('transcript'))
             data['skip_reason'] = reason
             data['process_identity'] = tree.get(int(pid))
@@ -253,7 +359,7 @@ def synchronize(data, sessions, apply):
     tree = processes()
     if not tree.get(pid) or tree.get(pid) != data['process_identity']:
         return 'identity_changed', None
-    info, reason = sessions.inspect(pid, tree)
+    info, reason = sessions.inspect(pid, tree, data.get('pane_title'))
     if reason or not info or info['pid'] != data.get('codebuddy_pid') \
             or info['session_id'] != data.get('codebuddy_session_id') or info.get('name') != name:
         return 'identity_changed', None
@@ -266,6 +372,69 @@ def synchronize(data, sessions, apply):
     tmux(socket, 'select-pane', '-t', pane, '-T', name.replace('#', '##'))
     after = tmux(socket, 'display-message', '-p', '-t', pane, '#{pane_title}')
     return ('updated' if after == name else 'verification_mismatch'), after
+
+
+def manifest_entries(records):
+    """-> restorable pane records, in a stable order."""
+    entries = []
+    for data in records:
+        session_id = data.get('codebuddy_session_id')
+        if not session_id:
+            continue
+        entries.append({
+            'session': data.get('session'),
+            'window_order': data.get('window_order'),
+            'pane_order': data.get('pane_order'),
+            'window_index': data.get('window_index'),
+            'pane_index': data.get('pane_index'),
+            'cwd': data.get('pane_cwd'),
+            'session_id': session_id,
+            'session_id_source': data.get('conversation_id_source'),
+            'pid_file_session_id': data.get('pid_file_session_id'),
+            'title': data.get('codebuddy_chat_name'),
+        })
+    entries.sort(key=lambda e: (e['session'] or '', e['window_order'] or 0, e['pane_order'] or 0))
+    return entries
+
+
+def pane_key(entry):
+    return entry.get('session'), entry.get('window_order'), entry.get('pane_order')
+
+
+def update_manifest(path, records, scoped):
+    """Refresh the restore manifest.
+
+    A full sweep replaces it. A scoped run (one pane, from the hook) merges, so
+    it can never truncate the manifest down to the panes it happened to look at.
+    """
+    entries = manifest_entries(records)
+    if scoped and path.exists():
+        previous = load_manifest(path)
+        covered = {pane_key(e) for e in entries}
+        entries.extend(e for e in previous['panes'] if pane_key(e) not in covered)
+        entries.sort(key=lambda e: (e['session'] or '', e['window_order'] or 0,
+                                    e['pane_order'] or 0))
+    document = {
+        'version': 1,
+        'captured_at': datetime.now().astimezone().isoformat(),
+        'sockets': sorted({r['socket'] for r in records if r.get('socket')}),
+        'panes': entries,
+    }
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2) + '\n',
+                         encoding='utf-8')
+    os.replace(temporary, path)
+    return document
+
+
+def load_manifest(path):
+    try:
+        document = json.loads(Path(path).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {'version': 1, 'panes': []}
+    if not isinstance(document, dict) or not isinstance(document.get('panes'), list):
+        return {'version': 1, 'panes': []}
+    return document
 
 
 def run(options):
@@ -308,6 +477,9 @@ def run(options):
                 log.write('result', status=status, pane_title_after=after, **data)
                 if options.verbose:
                     print(json.dumps(dict(status=status, **data), ensure_ascii=False))
+            manifest = update_manifest(options.manifest, records, scoped=bool(options.only_session))
+            log.write('manifest', path=str(options.manifest), scoped=bool(options.only_session),
+                      pane_count=len(manifest['panes']), captured_at=manifest['captured_at'])
             log.write('run_end', socket_count=len(sockets), pane_count=len(records), counts=dict(counts))
             if not options.quiet:
                 print(json.dumps(dict(panes=len(records), counts=dict(counts)), ensure_ascii=False))
@@ -332,6 +504,8 @@ def main():
     parser.add_argument('--only-session', action='append', default=None,
                         help='Restrict to these CodeBuddy session ids; repeat for several')
     parser.add_argument('--name-source', choices=('auto', 'custom', 'ai'))
+    parser.add_argument('--manifest', type=Path,
+                        help='Restore manifest to refresh (default: state dir)')
     parser.add_argument('--quiet', action='store_true', help='Suppress the summary line')
     parser.add_argument('--verbose', action='store_true')
     options = parser.parse_args()
@@ -342,6 +516,8 @@ def main():
     options.socket = options.socket if options.socket is not None else config.get('sockets', [])
     options.only_session = set(options.only_session or [])
     options.name_source = options.name_source or config.get('name_source', 'auto')
+    options.manifest = Path(options.manifest or config.get('manifest')
+                            or options.state_dir / MANIFEST_NAME).expanduser().resolve()
     if sys.platform != 'linux' or not shutil.which('tmux'):
         parser.error('Linux with /proc and tmux in PATH is required')
     try:
