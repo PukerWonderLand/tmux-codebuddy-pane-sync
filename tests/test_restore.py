@@ -39,7 +39,9 @@ class ManifestTestCase(unittest.TestCase):
         self.state = self.tmp / 'state'
 
     def entry(self, **overrides):
-        entry = dict(session='work1', window_order=0, pane_order=0, cwd='/home/codex',
+        # cwd must exist or restore() skips the entry as missing_cwd; a Docker
+        # runner has no /home/codex, so use the test's own temporary directory.
+        entry = dict(session='work1', window_order=0, pane_order=0, cwd=str(self.tmp),
                      session_id='sid-1', session_id_source='endpoint', title='Name')
         entry.update(overrides)
         return entry
