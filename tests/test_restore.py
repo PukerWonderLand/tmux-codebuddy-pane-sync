@@ -56,13 +56,15 @@ class TestManifestBuilding(ManifestTestCase):
         import tmux_codebuddy_pane_sync as sync
         records = [dict(session='work1', window_id='@7', pane_id='%39', window_index=7,
                         pane_index=39, window_order=0, pane_order=3, pane_cwd='/home/codex',
+                        window_layout='1f24,200x50,0,0{100x50,0,0,0,49x50,101,0,1}',
                         codebuddy_session_id='sid-1', conversation_id_source='endpoint',
                         pid_file_session_id='stale', codebuddy_chat_name='Name',
                         socket='/tmp/x.sock')]
         self.assertEqual(sync.manifest_entries(records), [dict(
             session='work1', window_order=0, pane_order=3, window_index=7, pane_index=39,
             cwd='/home/codex', session_id='sid-1', session_id_source='endpoint',
-            pid_file_session_id='stale', title='Name')])
+            pid_file_session_id='stale', title='Name',
+            window_layout='1f24,200x50,0,0{100x50,0,0,0,49x50,101,0,1}')])
 
     def test_panes_without_a_session_are_skipped(self):
         import tmux_codebuddy_pane_sync as sync
@@ -102,6 +104,21 @@ class TestManifestBuilding(ManifestTestCase):
         self.assertIsNone(restore.load_manifest(self.manifest))
         self.write([])
         self.assertIsNone(restore.load_manifest(self.tmp / 'missing.json'))
+
+
+class TestLayoutPaneCount(ManifestTestCase):
+    def test_counts_leaves_not_the_root(self):
+        self.assertEqual(restore.layout_pane_count(
+            '1f24,200x50,0,0{100x50,0,0,0,49x50,101,0,1,49x50,151,0,2}'), 3)
+        self.assertEqual(restore.layout_pane_count(
+            '49c2,80x24,0,0[80x12,0,0,0,80x5,0,13,13,80x5,0,19,14]'), 3)
+
+    def test_a_single_pane_window(self):
+        self.assertEqual(restore.layout_pane_count('b25e,194x59,0,0{194x59,0,0,20}'), 1)
+
+    def test_missing_layouts_count_zero(self):
+        self.assertEqual(restore.layout_pane_count(''), 0)
+        self.assertEqual(restore.layout_pane_count(None), 0)
 
 
 class TestLaunchCommand(ManifestTestCase):
@@ -339,6 +356,40 @@ class TestRestoreEndToEnd(unittest.TestCase):
         self.write_manifest([self.entry(session_id='')])
         self.run_restore('--apply')
         self.assertEqual(self.results()[0]['status'], 'malformed_entry')
+
+    def test_the_recorded_split_geometry_is_restored(self):
+        """The whole point of the layout field: rebuild left/right, not stacked."""
+        # Record a real horizontal (side by side) layout from this tmux server.
+        self.tmux('new-session', '-d', '-s', 'geosrc', '-x', '200', '-y', '50',
+                  '-c', str(self.workdir))
+        self.tmux('split-window', '-h', '-t', 'geosrc:0')
+        self.tmux('split-window', '-h', '-t', 'geosrc:0')
+        layout = self.tmux('display-message', '-p', '-t', 'geosrc:0', '#{window_layout}')
+        original = self.tmux('list-panes', '-t', 'geosrc:0', '-F',
+                             '#{pane_width}x#{pane_height}@#{pane_left},#{pane_top}').splitlines()
+        self.tmux('kill-session', '-t', 'geosrc')
+
+        self.write_manifest([self.entry(pane_order=i, session_id=f'sid-{i}', window_layout=layout)
+                             for i in range(3)])
+        self.run_restore('--apply')
+        self.assertEqual(self.wait_for_calls(3), ['-r sid-0', '-r sid-1', '-r sid-2'])
+
+        restored = self.tmux('list-panes', '-t', 'restored', '-F',
+                             '#{pane_width}x#{pane_height}@#{pane_left},#{pane_top}').splitlines()
+        self.assertEqual(sorted(restored), sorted(original))
+        # left/right: same top, different left
+        tops = {line.split('@')[1].split(',')[1] for line in restored}
+        self.assertEqual(len(tops), 1)
+        self.assertEqual([r['status'] for r in self.results()],
+                         ['layout_applied', 'launched', 'launched', 'launched'])
+
+    def test_a_layout_for_a_different_pane_count_is_not_applied(self):
+        """Applying a 3-pane layout to a 1-pane window would wreck it."""
+        three = '1f24,200x50,0,0{100x50,0,0,0,49x50,101,0,1,49x50,151,0,2}'
+        self.write_manifest([self.entry(pane_order=0, session_id='sid-0', window_layout=three)])
+        self.run_restore('--apply')
+        self.assertEqual(self.results()[0]['status'], 'launched')
+        self.assertNotIn('layout_applied', [r['status'] for r in self.results()])
 
     def test_layout_window_gives_each_conversation_its_own_window(self):
         """For clients that show one tmux window per visible tab."""

@@ -304,12 +304,13 @@ def list_panes(socket):
     """-> one dict per pane, with its layout position, from a single tmux call."""
     lines = tmux(socket, 'list-panes', '-a', '-F',
                  '#{session_id} #{window_id} #{pane_id} #{pane_pid} '
-                 '#{window_index} #{pane_index}').splitlines()
+                 '#{window_index} #{pane_index} #{window_layout}').splitlines()
     rows = []
     for line in lines:
-        session_id, window_id, pane_id, pid, window, pane = line.split()
+        session_id, window_id, pane_id, pid, window, pane, layout = line.split()
         rows.append(dict(session_id=session_id, window_id=window_id, pane_id=pane_id,
-                         pane_pid=int(pid), window_index=int(window), pane_index=int(pane)))
+                         pane_pid=int(pid), window_index=int(window), pane_index=int(pane),
+                         window_layout=layout))
     return rows
 
 
@@ -323,7 +324,8 @@ def snapshot(socket, sessions, tree, only_sessions=()):
         target = f'{session}:{window}.{pane}'
         data = dict(socket=socket, session_id=session, window_id=window,
                     pane_id=pane, pane_pid=pid,
-                    window_index=row['window_index'], pane_index=row['pane_index'])
+                    window_index=row['window_index'], pane_index=row['pane_index'],
+                    window_layout=row.get('window_layout'))
         data['window_order'], data['pane_order'] = ordinals.get(pane, (None, None))
         try:
             data['session'] = tmux(socket, 'display-message', '-p', '-t', target, '#{session_name}')
@@ -389,6 +391,7 @@ def manifest_entries(records):
             'window_index': data.get('window_index'),
             'pane_index': data.get('pane_index'),
             'cwd': data.get('pane_cwd'),
+            'window_layout': data.get('window_layout'),
             'session_id': session_id,
             'session_id_source': data.get('conversation_id_source'),
             'pid_file_session_id': data.get('pid_file_session_id'),

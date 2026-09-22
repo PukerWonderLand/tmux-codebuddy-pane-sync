@@ -17,6 +17,7 @@ import glob
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -125,6 +126,16 @@ def find_workbuddy(configured):
     return None
 
 
+def layout_pane_count(layout):
+    """How many panes a tmux layout string describes.
+
+    Leaves look like "100x50,0,0,0"; the root is "1f24,200x50,0,0{...}" with only
+    two numbers after the size, so requiring four isolates the leaves. Needed
+    because a layout must not be applied to a window with a different pane count.
+    """
+    return len(re.findall(r'\d+x\d+,\d+,\d+,\d+', layout or ''))
+
+
 def launch_command(workbuddy, cwd, session_id):
     return f'cd {shlex.quote(cwd)} && {shlex.quote(workbuddy)} -r {shlex.quote(session_id)}'
 
@@ -229,6 +240,44 @@ def restore(document, options, log):
         log.write('run_error', error='cannot start the tmux server')
         counts['server_unavailable'] += 1
         return counts
+
+    # Group by window: a window's split geometry has to be applied after its panes
+    # exist and before any conversation starts in them, so the first pass builds
+    # every pane and layout, and the second pass only starts conversations.
+    groups = {}
+    for entry in entries:
+        groups.setdefault((entry.get('session'), entry.get('window_order')), []).append(entry)
+
+    placed = {}
+    if options.apply:
+        for (session, window_order), members in groups.items():
+            ordered = sorted(members, key=lambda e: e.get('pane_order') or 0)
+            for entry in ordered:
+                key = (session, window_order, entry.get('pane_order'))
+                try:
+                    placed[key] = ensure_position(options.socket, session, window_order,
+                                                  entry['pane_order'], entry.get('cwd'))
+                except (subprocess.SubprocessError, OSError) as error:
+                    log.write('restore', status='error', stage='create_pane',
+                              error=error_text(error), session=session,
+                              window_order=window_order, pane_order=entry.get('pane_order'))
+            layout = next((m.get('window_layout') for m in ordered if m.get('window_layout')), None)
+            if set(placed) and layout:
+                current = session_layout(options.socket, session) or []
+                if window_order < len(current):
+                    window_index, panes = current[window_order]
+                    if layout_pane_count(layout) == len(panes):
+                        # tmux maps the structure onto the window's panes by
+                        # position and rewrites the stale pane ids inside it, so a
+                        # layout recorded on another boot restores the real
+                        # geometry (measured: rebuilt 200x25/200x12/200x11 stacked
+                        # panes became the original 100x50 + 49x50 + 49x50 columns).
+                        ok = tmux_ok(options.socket, 'select-layout', '-t',
+                                     f'{session}:{window_index}', layout)
+                        log.write('restore', status='layout_applied' if ok else 'layout_rejected',
+                                  session=session, window_order=window_order,
+                                  window_index=window_index, panes=len(panes), layout=layout)
+
     launched_ids = set()
     for entry in entries:
         session = entry.get('session')
@@ -269,8 +318,11 @@ def restore(document, options, log):
                       command=launch_command(workbuddy, cwd, session_id), **base)
             continue
         try:
-            pane_id, how = ensure_position(options.socket, session, window_order,
-                                           pane_order, cwd)
+            pane_id, how = placed.get((session, window_order, pane_order), (None, None))
+            if not pane_id:
+                counts['error'] += 1
+                log.write('restore', status='error', stage='pane_missing', **base)
+                continue
             base.update(pane_id=pane_id, pane_how=how)
             pane_pid = int(tmux_run(options.socket, 'display-message', '-p', '-t', pane_id,
                                     '#{pane_pid}'))
