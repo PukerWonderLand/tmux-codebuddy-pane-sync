@@ -216,6 +216,15 @@ def restore(document, options, log):
     entries = [normalize_entry(dict(e)) for e in document['panes']]
     if options.only_tmux_session:
         entries = [e for e in entries if e.get('session') in options.only_tmux_session]
+    if options.layout == 'window':
+        # One conversation per tmux window, in manifest order. Clients that show
+        # a tmux window as one visible tab then get one tab per conversation,
+        # instead of several conversations hidden behind each other's splits.
+        seen = {}
+        for entry in entries:
+            index = seen.get(entry.get('session'), 0)
+            seen[entry['session']] = index + 1
+            entry['window_order'], entry['pane_order'] = index, 0
     if not tmux_ok(options.socket, 'start-server'):
         log.write('run_error', error='cannot start the tmux server')
         counts['server_unavailable'] += 1
@@ -359,6 +368,9 @@ def main():
     parser.add_argument('--socket', help='Explicit tmux socket; default is the default server')
     parser.add_argument('--workbuddy-command')
     parser.add_argument('--stagger-seconds', type=int)
+    parser.add_argument('--layout', choices=('pane', 'window'),
+                        help='pane (default): reproduce the recorded splits; '
+                             'window: give every conversation its own window')
     parser.add_argument('--verify-seconds', type=int,
                         help='Poll this long for each launch to confirm it started (0 = do not)')
     parser.add_argument('--only-tmux-session', action='append', default=None,
@@ -376,6 +388,7 @@ def main():
                                else config.get('stagger_seconds', DEFAULT_STAGGER_SECONDS))
     options.verify_seconds = (options.verify_seconds if options.verify_seconds is not None
                               else config.get('verify_seconds', DEFAULT_VERIFY_SECONDS))
+    options.layout = options.layout or config.get('restore_layout', 'pane')
     options.socket = options.socket or config.get('restore_socket') or None
     options.only_tmux_session = set(options.only_tmux_session or [])
     if sys.platform != 'linux' or not shutil.which('tmux'):

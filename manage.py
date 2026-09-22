@@ -210,6 +210,9 @@ def install(args, layout):
     config['name_source'] = args.name_source or config.get('name_source', 'auto')
     if args.workbuddy_command:
         config['workbuddy_command'] = args.workbuddy_command
+    if args.restore_layout:
+        config['restore_layout'] = args.restore_layout
+    config.setdefault('restore_layout', 'pane')
     if args.socket is not None:
         config['sockets'] = [str(Path(p).expanduser().resolve()) for p in args.socket]
     else:
@@ -319,6 +322,9 @@ def main():
                         help='Launcher the restore service should resume conversations with')
     parser.add_argument('--stagger-seconds', type=int,
                         help='Delay between boot-time launches (default 3)')
+    parser.add_argument('--restore-layout', choices=('pane', 'window'),
+                        help='pane (default): rebuild the recorded splits; '
+                             'window: one conversation per tmux window')
     parser.add_argument('--no-hook', action='store_true',
                         help='Do not register CodeBuddy hooks; timer only')
     parser.add_argument('--no-restore', action='store_true',

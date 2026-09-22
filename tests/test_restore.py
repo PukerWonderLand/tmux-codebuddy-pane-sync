@@ -197,7 +197,7 @@ class TestRestoreDryRun(ManifestTestCase):
 
     def options(self, **overrides):
         options = mock.Mock(workbuddy_command=str(self.launcher), only_tmux_session=set(),
-                            socket=None, apply=False, stagger_seconds=0)
+                            socket=None, apply=False, stagger_seconds=0, layout='pane')
         for key, value in overrides.items():
             setattr(options, key, value)
         return options
@@ -340,6 +340,29 @@ class TestRestoreEndToEnd(unittest.TestCase):
         self.run_restore('--apply')
         self.assertEqual(self.results()[0]['status'], 'malformed_entry')
 
+    def test_layout_window_gives_each_conversation_its_own_window(self):
+        """For clients that show one tmux window per visible tab."""
+        self.write_manifest([self.entry(pane_order=0, session_id='sid-1'),
+                             self.entry(pane_order=1, session_id='sid-2'),
+                             self.entry(pane_order=2, session_id='sid-3')])
+        self.run_restore('--apply', '--layout', 'window')
+        self.assertEqual(sorted(self.wait_for_calls(3)), ['-r sid-1', '-r sid-2', '-r sid-3'])
+        self.assertEqual(len(self.tmux('list-windows', '-t', 'restored',
+                                       '-F', '#{window_index}').splitlines()), 3)
+        self.assertEqual(len(self.tmux('list-panes', '-s', '-t', 'restored',
+                                       '-F', '#{pane_id}').splitlines()), 3)
+        self.assertEqual([r['status'] for r in self.results()],
+                         ['launched', 'launched', 'launched'])
+
+    def test_layout_window_is_idempotent(self):
+        self.write_manifest([self.entry(pane_order=0, session_id='sid-1'),
+                             self.entry(pane_order=1, session_id='sid-2')])
+        self.run_restore('--apply', '--layout', 'window')
+        self.assertEqual(self.wait_for_calls(2), ['-r sid-1', '-r sid-2'])
+        self.run_restore('--apply', '--layout', 'window')
+        self.assertEqual(self.calls_made(), ['-r sid-1', '-r sid-2'])  # no relaunch
+        self.assertEqual([r['status'] for r in self.results()].count('already_running'), 2)
+
     def test_three_panes_in_one_window_all_get_their_conversation(self):
         """Splitting used to renumber the window, so a later entry landed on a pane
         an earlier entry had taken and was dropped as already_running."""
@@ -348,7 +371,7 @@ class TestRestoreEndToEnd(unittest.TestCase):
                              self.entry(pane_order=2, session_id='sid-3')])
         self.run_restore('--apply')
         self.assertEqual(sorted(self.wait_for_calls(3)), ['-r sid-1', '-r sid-2', '-r sid-3'])
-        self.assertEqual(len(self.tmux('list-panes', '-t', 'restored',
+        self.assertEqual(len(self.tmux('list-panes', '-s', '-t', 'restored',
                                        '-F', '#{pane_id}').splitlines()), 3)
         self.assertEqual([r['status'] for r in self.results()],
                          ['launched', 'launched', 'launched'])
