@@ -264,6 +264,9 @@ def install(args, layout):
         '[Unit]\nDescription=Restore tmux panes and resume their CodeBuddy conversations\n'
         'After=network-online.target\nWants=network-online.target\n\n'
         '[Service]\nType=oneshot\n'
+        # Without this systemd kills the tmux server this unit starts, because a
+        # oneshot service tears down its whole cgroup when ExecStart exits.
+        'KillMode=process\n'
         f'Environment={quote("PATH=" + search_path)}\n'
         # Give the network and the user manager a moment before starting a dozen CLIs.
         'ExecStartPre=/bin/sleep 20\n'

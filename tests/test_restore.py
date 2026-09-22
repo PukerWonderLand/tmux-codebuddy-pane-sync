@@ -340,6 +340,31 @@ class TestRestoreEndToEnd(unittest.TestCase):
         self.run_restore('--apply')
         self.assertEqual(self.results()[0]['status'], 'malformed_entry')
 
+    def test_three_panes_in_one_window_all_get_their_conversation(self):
+        """Splitting used to renumber the window, so a later entry landed on a pane
+        an earlier entry had taken and was dropped as already_running."""
+        self.write_manifest([self.entry(pane_order=0, session_id='sid-1'),
+                             self.entry(pane_order=1, session_id='sid-2'),
+                             self.entry(pane_order=2, session_id='sid-3')])
+        self.run_restore('--apply')
+        self.assertEqual(sorted(self.wait_for_calls(3)), ['-r sid-1', '-r sid-2', '-r sid-3'])
+        self.assertEqual(len(self.tmux('list-panes', '-t', 'restored',
+                                       '-F', '#{pane_id}').splitlines()), 3)
+        self.assertEqual([r['status'] for r in self.results()],
+                         ['launched', 'launched', 'launched'])
+
+    def test_apply_writes_the_restore_marker(self):
+        import tmux_codebuddy_pane_sync as sync
+        self.write_manifest([self.entry()])
+        self.run_restore('--apply')
+        marker = json.loads((self.state / 'last-restore.json').read_text())
+        self.assertEqual(marker['boot_id'], sync.boot_id())
+
+    def test_dry_run_writes_no_marker(self):
+        self.write_manifest([self.entry()])
+        self.run_restore()
+        self.assertFalse((self.state / 'last-restore.json').exists())
+
     def test_a_killed_pane_does_not_relaunch_the_survivor(self):
         """Killing a pane renumbers the rest; that must not start a second writer."""
         self.write_manifest([self.entry(pane_order=0, session_id='sid-1'),
@@ -393,3 +418,52 @@ class TestRestoreEndToEnd(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestBootAwareManifest(ManifestTestCase):
+    """A sweep after a reboot must not erase the mapping a restore needs."""
+
+    def record(self, session='work1', window_order=0, pane_order=0, session_id='sid-1'):
+        return dict(session=session, window_order=window_order, pane_order=pane_order,
+                    pane_cwd=str(self.tmp), codebuddy_session_id=session_id,
+                    socket='/tmp/x.sock')
+
+    def test_a_sweep_before_the_restore_keeps_what_it_cannot_see(self):
+        import tmux_codebuddy_pane_sync as sync
+        self.write([self.entry(session='work1', session_id='sid-1'),
+                    self.entry(session='work2', pane_order=1, session_id='sid-2')])
+        # Only work1 came back with a session; work2 is still an empty shell.
+        document = sync.update_manifest(self.manifest, [self.record()],
+                                        scoped=False, state_dir=self.state)
+        self.assertEqual({(e['session'], e['session_id']) for e in document['panes']},
+                         {('work1', 'sid-1'), ('work2', 'sid-2')})
+
+    def test_after_the_restore_a_sweep_replaces_normally(self):
+        import tmux_codebuddy_pane_sync as sync
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / 'last-restore.json').write_text(
+            json.dumps({'boot_id': sync.boot_id()}), encoding='utf-8')
+        self.write([self.entry(session='stale', session_id='old')])
+        document = sync.update_manifest(self.manifest, [self.record()],
+                                        scoped=False, state_dir=self.state)
+        self.assertEqual([(e['session'], e['session_id']) for e in document['panes']],
+                         [('work1', 'sid-1')])
+
+    def test_a_marker_from_an_earlier_boot_still_counts_as_pending(self):
+        import tmux_codebuddy_pane_sync as sync
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / 'last-restore.json').write_text(
+            json.dumps({'boot_id': 'some-previous-boot'}), encoding='utf-8')
+        self.assertTrue(sync.restore_pending(self.state))
+
+    def test_a_corrupt_marker_counts_as_pending(self):
+        import tmux_codebuddy_pane_sync as sync
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / 'last-restore.json').write_text('{oops', encoding='utf-8')
+        self.assertTrue(sync.restore_pending(self.state))
+
+    def test_the_manifest_records_the_boot(self):
+        import tmux_codebuddy_pane_sync as sync
+        document = sync.update_manifest(self.manifest, [self.record()],
+                                        scoped=False, state_dir=self.state)
+        self.assertEqual(document['boot_id'], sync.boot_id())

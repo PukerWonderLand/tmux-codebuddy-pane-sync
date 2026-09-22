@@ -27,6 +27,7 @@ import uuid
 VERSION = '0.2.0'
 APP = 'tmux-codebuddy-pane-sync'
 MANIFEST_NAME = 'restore-manifest.json'
+RESTORE_MARKER = 'last-restore.json'
 DEFAULT_STAGGER_SECONDS = 3
 DEFAULT_VERIFY_SECONDS = 5
 
@@ -164,7 +165,12 @@ def ensure_position(socket, session, window_order, pane_order, cwd):
         created = True
     window_index, panes = layout[window_order]
     while len(panes) <= pane_order:
-        tmux_run(socket, 'split-window', '-d', '-t', f'{session}:{window_index}', '-c', cwd)
+        # Split the LAST pane of the window. Splitting the window itself makes
+        # tmux insert the new pane next to the current one, which renumbers the
+        # panes already placed (measured: [%0,%1] became [%0,%2,%1]) and sends a
+        # later entry to a pane an earlier entry had already taken.
+        tmux_run(socket, 'split-window', '-d', '-t',
+                 f'{session}:{window_index}.{panes[-1][0]}', '-c', cwd)
         layout = session_layout(socket, session)
         window_index, panes = layout[window_order]
         created = True
@@ -284,6 +290,28 @@ def restore(document, options, log):
     return counts
 
 
+def boot_id():
+    try:
+        return Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip()
+    except OSError:
+        return None
+
+
+def write_restore_marker(state_dir, counts):
+    """Record that this boot has been restored.
+
+    Until this marker names the current boot, the recorder keeps manifest entries
+    it cannot currently see, because those panes are still empty shells.
+    """
+    payload = {'boot_id': boot_id(),
+               'restored_at': datetime.now().astimezone().isoformat(),
+               'counts': dict(counts)}
+    temporary = state_dir / (RESTORE_MARKER + '.tmp')
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n',
+                         encoding='utf-8')
+    os.replace(temporary, state_dir / RESTORE_MARKER)
+
+
 def run(options):
     os.umask(0o077)
     options.state_dir.mkdir(parents=True, exist_ok=True)
@@ -304,6 +332,8 @@ def run(options):
                 print(f'{APP}: no usable manifest at {options.manifest}; nothing restored')
                 return 0
             counts = restore(document, options, log)
+            if options.apply:
+                write_restore_marker(options.state_dir, counts)
             log.write('run_end', captured_at=document.get('captured_at'), counts=dict(counts))
             if not options.quiet:
                 print(json.dumps(dict(manifest_panes=len(document['panes']), counts=dict(counts)),

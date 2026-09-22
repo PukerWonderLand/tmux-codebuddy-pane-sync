@@ -19,6 +19,7 @@ import urllib.request
 VERSION = '0.2.0'
 APP = 'tmux-codebuddy-pane-sync'
 MANIFEST_NAME = 'restore-manifest.json'
+RESTORE_MARKER = 'last-restore.json'
 
 # The process's own loopback API answers with the session it is *currently*
 # showing, which the pid file does not after a /resume. The request header is a
@@ -401,14 +402,42 @@ def pane_key(entry):
     return entry.get('session'), entry.get('window_order'), entry.get('pane_order')
 
 
-def update_manifest(path, records, scoped):
+def boot_id():
+    try:
+        return Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip()
+    except OSError:
+        return None
+
+
+def restore_pending(state_dir):
+    """True until a restore has run for the current boot.
+
+    Right after a reboot every pane is still an empty shell, so an ordinary full
+    sweep would erase exactly the pre-reboot mapping that a restore needs. The
+    restore service writes a marker when it has run; from then on sweeps replace
+    the manifest as usual, which is what makes stale entries disappear.
+    """
+    current = boot_id()
+    if not current:
+        return False
+    try:
+        marker = json.loads((Path(state_dir) / RESTORE_MARKER).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return True
+    return not isinstance(marker, dict) or marker.get('boot_id') != current
+
+
+def update_manifest(path, records, scoped, state_dir=None):
     """Refresh the restore manifest.
 
-    A full sweep replaces it. A scoped run (one pane, from the hook) merges, so
-    it can never truncate the manifest down to the panes it happened to look at.
+    A full sweep replaces it -- except while a restore is still pending for this
+    boot, when entries for panes that currently look empty are kept. A scoped run
+    (one pane, from the hook) always merges, so it can never truncate the
+    manifest down to the panes it happened to look at.
     """
     entries = manifest_entries(records)
-    if scoped and path.exists():
+    merge = scoped or (state_dir is not None and restore_pending(state_dir))
+    if merge and path.exists():
         previous = load_manifest(path)
         covered = {pane_key(e) for e in entries}
         entries.extend(e for e in previous['panes'] if pane_key(e) not in covered)
@@ -417,6 +446,7 @@ def update_manifest(path, records, scoped):
     document = {
         'version': 1,
         'captured_at': datetime.now().astimezone().isoformat(),
+        'boot_id': boot_id(),
         'sockets': sorted({r['socket'] for r in records if r.get('socket')}),
         'panes': entries,
     }
@@ -477,7 +507,9 @@ def run(options):
                 log.write('result', status=status, pane_title_after=after, **data)
                 if options.verbose:
                     print(json.dumps(dict(status=status, **data), ensure_ascii=False))
-            manifest = update_manifest(options.manifest, records, scoped=bool(options.only_session))
+            manifest = update_manifest(options.manifest, records,
+                                       scoped=bool(options.only_session),
+                                       state_dir=options.state_dir)
             log.write('manifest', path=str(options.manifest), scoped=bool(options.only_session),
                       pane_count=len(manifest['panes']), captured_at=manifest['captured_at'])
             log.write('run_end', socket_count=len(sockets), pane_count=len(records), counts=dict(counts))
