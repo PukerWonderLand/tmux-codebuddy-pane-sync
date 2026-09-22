@@ -48,6 +48,18 @@ Requires **Linux or macOS**, Python **3.9+**, and tmux. The periodic service use
 systemd user manager on Linux and a LaunchAgent on macOS; running the script directly
 needs neither.
 
+`./install.sh` uses `python3`, so the service and hook record whichever interpreter
+that resolves to — on macOS that may be the system 3.9. **3.9 is tested and works**
+(the suite passes on both 3.9 and 3.12), but to match your other services you can name
+the interpreter explicitly:
+
+```
+/Users/mac/.local/bin/python3.12 manage.py install
+```
+
+Re-running after changing it is safe: the hook command is updated in place rather than
+duplicated.
+
 ### The one real difference between the platforms
 
 | | Linux | macOS |

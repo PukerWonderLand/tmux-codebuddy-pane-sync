@@ -38,6 +38,16 @@ cd tmux-codebuddy-pane-sync
 
 要求：**Linux 或 macOS**、Python **3.9+**、tmux。定时服务在 Linux 上需要 systemd 用户管理器，在 macOS 上是 LaunchAgent；直接运行脚本两者都不需要。
 
+`./install.sh` 用的是 `python3`，所以服务与 hook 会记录它解析到的那个解释器——macOS 上可能是
+系统自带的 3.9。**3.9 已实测可用**（全套测试在 3.9 与 3.12 下均通过），但若想和你其他服务
+统一，可以指定解释器直接调用安装器：
+
+```
+/Users/mac/.local/bin/python3.12 manage.py install
+```
+
+改钉解释器后建议再跑一遍：hook 命令会**原地更新**（不会多出一个条目）。
+
 ```
 # 只看会改什么，不改名
 python3 tmux_codebuddy_pane_sync.py --dry-run --verbose
