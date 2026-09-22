@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import codebuddy_restore as restore  # noqa: E402
+import platform_compat as compat  # noqa: E402
 
 TMUX = shutil.which('tmux')
 SCRIPT = ROOT / 'codebuddy_restore.py'
@@ -54,17 +55,28 @@ class ManifestTestCase(unittest.TestCase):
 class TestManifestBuilding(ManifestTestCase):
     def test_projects_pane_records_into_entries(self):
         import tmux_codebuddy_pane_sync as sync
-        records = [dict(session='work1', window_id='@7', pane_id='%39', window_index=7,
+        records = [dict(session='work1', session_id='$7', window_id='@7', pane_id='%39',
+                        window_index=7,
                         pane_index=39, window_order=0, pane_order=3, pane_cwd='/home/codex',
                         window_layout='1f24,200x50,0,0{100x50,0,0,0,49x50,101,0,1}',
                         codebuddy_session_id='sid-1', conversation_id_source='endpoint',
                         pid_file_session_id='stale', codebuddy_chat_name='Name',
                         socket='/tmp/x.sock')]
         self.assertEqual(sync.manifest_entries(records), [dict(
-            session='work1', window_order=0, pane_order=3, window_index=7, pane_index=39,
+            session='work1', tmux_session_id='$7', window_order=0, pane_order=3,
+            window_index=7, pane_index=39,
             cwd='/home/codex', session_id='sid-1', session_id_source='endpoint',
             pid_file_session_id='stale', title='Name',
             window_layout='1f24,200x50,0,0{100x50,0,0,0,49x50,101,0,1}')])
+
+    def test_the_tmux_session_id_is_optional(self):
+        """A record with no tmux session id still yields an entry, with a null hint."""
+        import tmux_codebuddy_pane_sync as sync
+        entries = sync.manifest_entries([dict(session='work1', pane_cwd='/tmp',
+                                             window_order=0, pane_order=0,
+                                             codebuddy_session_id='sid-1')])
+        self.assertEqual(len(entries), 1)
+        self.assertIsNone(entries[0]['tmux_session_id'])
 
     def test_panes_without_a_session_are_skipped(self):
         import tmux_codebuddy_pane_sync as sync
@@ -154,6 +166,34 @@ class TestFindWorkbuddy(ManifestTestCase):
                 mock.patch.object(restore.Path, 'home', return_value=home):
             self.assertEqual(restore.find_workbuddy('workbuddy'), str(home / '.local/bin/workbuddy'))
 
+    def test_the_default_launcher_is_platform_aware(self):
+        with mock.patch.object(compat, 'PLATFORM', 'linux'):
+            self.assertEqual(restore.default_launcher(), 'workbuddy')
+        with mock.patch.object(compat, 'PLATFORM', 'darwin'):
+            self.assertEqual(restore.default_launcher(), 'codebuddy')
+
+    def test_an_unrecognised_platform_falls_back_to_codebuddy(self):
+        with mock.patch.object(compat, 'PLATFORM', 'freebsd'):
+            self.assertEqual(restore.default_launcher(), 'codebuddy')
+
+    def test_the_other_cli_name_is_still_tried(self):
+        """A macOS box resolves `codebuddy` even though the default is a name."""
+        home = self.tmp / 'mixed-home'
+        (home / '.local/bin').mkdir(parents=True)
+        (home / '.local/bin/codebuddy').write_text('#!/bin/sh\n', encoding='utf-8')
+        with mock.patch.object(restore.shutil, 'which', return_value=None), \
+                mock.patch.object(restore.Path, 'home', return_value=home), \
+                mock.patch.object(compat, 'PLATFORM', 'linux'):
+            # Defaults to workbuddy on Linux, which is absent here.
+            self.assertEqual(restore.find_workbuddy(None), str(home / '.local/bin/codebuddy'))
+
+    def test_nothing_installed_resolves_to_none(self):
+        home = self.tmp / 'empty-home'
+        home.mkdir()
+        with mock.patch.object(restore.shutil, 'which', return_value=None), \
+                mock.patch.object(restore.Path, 'home', return_value=home):
+            self.assertIsNone(restore.find_workbuddy(None))
+
 
 class TestRestoreDryRun(ManifestTestCase):
     """--dry-run must be strictly read-only."""
@@ -224,6 +264,115 @@ class TestRestoreDryRun(ManifestTestCase):
         journal = restore.Journal(self.state / 'restore-log.jsonl', 'test-run')
         self.addCleanup(journal.close)
         return journal
+
+
+class TestSessionResolution(unittest.TestCase):
+    """Names are matched in Python; only ids are ever used as tmux targets.
+
+    tmux target syntax is ``session:window.pane``, so handing it a session name
+    that contains ``.`` or ``:`` silently means something else. These pin the
+    invariant directly, without needing a live server.
+    """
+
+    def _listing(self, text):
+        return mock.patch.object(restore, 'tmux_run', lambda socket, *args: text)
+
+    def test_list_sessions_parses_name_and_id(self):
+        with self._listing('a.b\t$1\nplain\t$2'):
+            self.assertEqual(restore.list_sessions(None), {'a.b': '$1', 'plain': '$2'})
+
+    def test_list_sessions_ignores_lines_without_both_fields(self):
+        with self._listing('\nonlyname\n\t$9\nreal\t$3'):
+            self.assertEqual(restore.list_sessions(None), {'real': '$3'})
+
+    def test_a_failed_listing_is_not_an_error(self):
+        def boom(socket, *args):
+            raise subprocess.SubprocessError('no server')
+
+        with mock.patch.object(restore, 'tmux_run', boom):
+            self.assertEqual(restore.list_sessions(None), {})
+            self.assertIsNone(restore.resolve_session(None, 'x'))
+
+    def test_the_name_is_authoritative(self):
+        with self._listing('work1\t$1\nother\t$2'):
+            self.assertEqual(restore.resolve_session(None, 'work1', '$2'), '$1')
+
+    def test_the_recorded_id_is_a_fallback(self):
+        """A session renamed since the sweep can still be found by its id."""
+        with self._listing('renamed\t$7'):
+            self.assertEqual(restore.resolve_session(None, 'gone', '$7'), '$7')
+
+    def test_nothing_resolving_returns_none(self):
+        with self._listing('other\t$3'):
+            self.assertIsNone(restore.resolve_session(None, 'gone', '$99'))
+
+    def test_create_session_returns_the_new_id(self):
+        calls = []
+
+        def fake(socket, *args):
+            calls.append(args)
+            return 'a.b\t$4' if args[0] == 'list-sessions' else ''
+
+        with mock.patch.object(restore, 'tmux_run', fake):
+            self.assertEqual(restore.create_session(None, 'a.b', '/tmp'), '$4')
+        # `-s` is a name argument, so a dotted name is legal here.
+        self.assertEqual(calls[0], ('new-session', '-d', '-s', 'a.b', '-c', '/tmp'))
+
+    def test_create_session_reports_failure(self):
+        def boom(socket, *args):
+            raise subprocess.SubprocessError('cannot create')
+
+        with mock.patch.object(restore, 'tmux_run', boom):
+            self.assertIsNone(restore.create_session(None, 'x', '/tmp'))
+
+    def test_ensure_position_uses_the_session_id_in_targets(self):
+        calls = []
+
+        def fake(socket, *args):
+            calls.append(args)
+            if args[0] == 'list-panes':
+                return '0 0 %0\n0 1 %1' if any(
+                    c[0] == 'split-window' for c in calls) else '0 0 %0'
+            return ''
+
+        with mock.patch.object(restore, 'tmux_run', fake):
+            pane, how = restore.ensure_position(None, '$5', 0, 1, '/tmp')
+        self.assertEqual((pane, how), ('%1', 'created'))
+        split = next(c for c in calls if c[0] == 'split-window')
+        self.assertTrue(split[split.index('-t') + 1].startswith('$5:'),
+                        f'the target should be id-based, got {split}')
+
+    def test_a_dotted_name_never_reaches_a_target(self):
+        calls = []
+
+        def fake(socket, *args):
+            calls.append(args)
+            if args[0] == 'list-sessions':
+                return 'deepseek4.1_work1\t$1'
+            if args[0] == 'list-panes':
+                return '0 0 %0\n0 1 %1' if any(
+                    c[0] == 'split-window' for c in calls) else '0 0 %0'
+            return ''
+
+        with mock.patch.object(restore, 'tmux_run', fake):
+            target = restore.resolve_session(None, 'deepseek4.1_work1')
+            restore.ensure_position(None, target, 0, 1, '/tmp')
+        targets = [args[args.index('-t') + 1] for args in calls if '-t' in args]
+        self.assertTrue(targets, 'the split should have produced a target')
+        for value in targets:
+            self.assertNotIn('deepseek4.1_work1', value)
+
+    def test_ensure_position_reports_an_unusable_session(self):
+        """A failed listing must be reported, not raise."""
+        with mock.patch.object(restore, 'tmux_run', lambda socket, *args: ''):
+            self.assertEqual(restore.ensure_position(None, '$1', 0, 0, '/tmp'),
+                             (None, 'session_unaddressable'))
+
+    def test_hint_session_id_reads_the_recorded_id(self):
+        self.assertEqual(restore.hint_session_id([{'tmux_session_id': '$3'}]), '$3')
+        self.assertEqual(restore.hint_session_id(
+            [{'tmux_session_id': None}, {'tmux_session_id': '$4'}]), '$4')
+        self.assertIsNone(restore.hint_session_id([{}, {'tmux_session_id': ''}]))
 
 
 @unittest.skipUnless(TMUX, 'tmux is required')
@@ -300,12 +449,50 @@ class TestRestoreEndToEnd(unittest.TestCase):
         self.assertEqual(self.calls_made(), [])
         self.assertEqual(self.results()[0]['status'], 'would_create_and_launch')
 
+    def test_a_session_name_containing_a_dot_is_still_restored(self):
+        """`.` is tmux's window separator, so a name used as a target breaks.
+
+        Before names were resolved to ids, ``new-session -s 'a.b'`` succeeded
+        (it takes a name) but every later ``-t 'a.b'`` was parsed as session
+        ``a``, window ``b``, so the restore died with ``can't find window: a``
+        and the conversation was never resumed. This is the regression guard for
+        that: names must never reach a ``-t`` argument.
+        """
+        self.write_manifest([self.entry(session='deepseek4.1_work1')])
+        result = self.run_restore('--apply')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.wait_for_calls(1), ['-r sid-1'])
+        self.assertEqual(self.results()[0]['status'], 'launched')
+        self.assertIn('deepseek4.1_work1',
+                      self.tmux('list-sessions', '-F', '#{session_name}').splitlines())
+
+    def test_a_colon_in_a_session_name_is_still_restored(self):
+        """The other half of tmux's target syntax has the same problem."""
+        self.write_manifest([self.entry(session='work:1')])
+        result = self.run_restore('--apply')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.wait_for_calls(1), ['-r sid-1'])
+        self.assertEqual(self.results()[0]['status'], 'launched')
+
+    def test_a_stale_recorded_session_id_falls_back_to_the_name(self):
+        """Ids are allocated per server, so the recorded hint cannot be trusted."""
+        self.write_manifest([self.entry(session='restored', tmux_session_id='$99')])
+        result = self.run_restore('--apply')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.wait_for_calls(1), ['-r sid-1'])
+        self.assertEqual(self.results()[0]['status'], 'launched')
+
     def test_apply_creates_the_pane_and_resumes_the_conversation(self):
         self.write_manifest([self.entry()])
         result = self.run_restore('--apply')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.tmux('list-panes', '-t', 'restored', '-F', '#{pane_current_path}'),
-                         str(self.workdir))
+        self.assertEqual(
+            # Compared after resolving: macOS reports a pane's cwd under
+            # /private/var/... while mkdtemp hands out /var/..., and the two are
+            # the same directory.
+            Path(self.tmux('list-panes', '-t', 'restored', '-F',
+                           '#{pane_current_path}')).resolve(),
+            Path(self.workdir).resolve())
         self.assertEqual(self.wait_for_calls(1), ['-r sid-1'])
         self.assertEqual(self.results()[0]['status'], 'launched')
         self.assertEqual(self.tmux('display-message', '-p', '-t', 'restored:0.0', '#{pane_title}'),
@@ -372,7 +559,9 @@ class TestRestoreEndToEnd(unittest.TestCase):
         self.write_manifest([self.entry(pane_order=i, session_id=f'sid-{i}', window_layout=layout)
                              for i in range(3)])
         self.run_restore('--apply')
-        self.assertEqual(self.wait_for_calls(3), ['-r sid-0', '-r sid-1', '-r sid-2'])
+        # Sorted for the same reason as test_layout_window_is_idempotent.
+        self.assertEqual(sorted(self.wait_for_calls(3)),
+                         ['-r sid-0', '-r sid-1', '-r sid-2'])
 
         restored = self.tmux('list-panes', '-t', 'restored', '-F',
                              '#{pane_width}x#{pane_height}@#{pane_left},#{pane_top}').splitlines()
@@ -409,9 +598,11 @@ class TestRestoreEndToEnd(unittest.TestCase):
         self.write_manifest([self.entry(pane_order=0, session_id='sid-1'),
                              self.entry(pane_order=1, session_id='sid-2')])
         self.run_restore('--apply', '--layout', 'window')
-        self.assertEqual(self.wait_for_calls(2), ['-r sid-1', '-r sid-2'])
+        # Sorted: each pane is launched by its own process and the log records
+        # them in completion order, which is not guaranteed.
+        self.assertEqual(sorted(self.wait_for_calls(2)), ['-r sid-1', '-r sid-2'])
         self.run_restore('--apply', '--layout', 'window')
-        self.assertEqual(self.calls_made(), ['-r sid-1', '-r sid-2'])  # no relaunch
+        self.assertEqual(sorted(self.calls_made()), ['-r sid-1', '-r sid-2'])  # no relaunch
         self.assertEqual([r['status'] for r in self.results()].count('already_running'), 2)
 
     def test_three_panes_in_one_window_all_get_their_conversation(self):
@@ -490,10 +681,6 @@ class TestRestoreEndToEnd(unittest.TestCase):
         self.assertEqual(self.calls_made(), [])
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class TestBootAwareManifest(ManifestTestCase):
     """A sweep after a reboot must not erase the mapping a restore needs."""
 
@@ -541,3 +728,7 @@ class TestBootAwareManifest(ManifestTestCase):
         document = sync.update_manifest(self.manifest, [self.record()],
                                         scoped=False, state_dir=self.state)
         self.assertEqual(document['boot_id'], sync.boot_id())
+
+
+if __name__ == '__main__':
+    unittest.main()

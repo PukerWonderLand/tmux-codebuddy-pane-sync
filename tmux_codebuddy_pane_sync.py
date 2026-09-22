@@ -16,6 +16,8 @@ import uuid
 from urllib.parse import urlsplit
 import urllib.request
 
+import platform_compat as compat
+
 VERSION = '0.2.0'
 APP = 'tmux-codebuddy-pane-sync'
 MANIFEST_NAME = 'restore-manifest.json'
@@ -52,44 +54,22 @@ def error_text(error):
     return (getattr(error, 'stderr', None) or str(error)).strip()
 
 
-def discover_sockets(explicit=()):
-    if explicit:
-        candidates = {Path(p).expanduser() for p in explicit}
-    else:
-        roots = {Path('/tmp'), Path(os.environ.get('TMUX_TMPDIR', '/tmp'))}
-        candidates = {p for root in roots for p in (root / f'tmux-{os.getuid()}').glob('*')}
-        if os.environ.get('TMUX'):
-            candidates.add(Path(os.environ['TMUX'].rsplit(',', 2)[0]))
-    result = []
-    for p in sorted(candidates):
-        try:
-            info = p.stat()
-            if stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid():
-                result.append(str(p))
-        except OSError:
-            pass
-    return result
+def discover_sockets(explicit=(), extra=()):
+    """tmux server sockets we may use.
+
+    ``extra`` carries sockets recorded in the manifest, so a server started with
+    a different ``TMPDIR`` (an SSH-started one, say) can still be found again.
+    """
+    return compat.discover_sockets(explicit, extra)
 
 
-def processes():
-    """pid -> (parent pid, start ticks); tolerate process exit during a scan."""
-    result = {}
-    for path in Path('/proc').glob('[0-9]*'):
-        try:
-            fields = (path / 'stat').read_text().rsplit(')', 1)[1].split()
-            result[int(path.name)] = (int(fields[1]), fields[19])
-        except (OSError, ValueError, IndexError):
-            pass
-    return result
-
-
-def descendants(pid, tree):
-    result = {pid}
-    while True:
-        expanded = result | {p for p, (parent, _) in tree.items() if parent in result}
-        if expanded == result:
-            return result
-        result = expanded
+# The process table, the subtree walk, the CLI lookup and the boot identity all
+# live in platform_compat because codebuddy_restore.py needs the identical
+# answers — two copies of boot_id() in particular would be a correctness bug,
+# since one program writes the value the other compares.
+processes = compat.processes
+descendants = compat.descendants
+boot_id = compat.boot_id
 
 
 class Sessions:
@@ -108,14 +88,9 @@ class Sessions:
         self.name_source = name_source
         self.endpoint_timeout = endpoint_timeout
 
-    @staticmethod
-    def is_codebuddy(pid):
-        try:
-            args = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
-        except OSError:
-            return False
-        return any(Path(os.fsdecode(a)).name in ('codebuddy', 'workbuddy')
-                   for a in args if a)
+    # Kept on the class because callers patch it here, but bound straight to the
+    # shared implementation so the two programs cannot drift apart.
+    is_codebuddy = staticmethod(compat.is_codebuddy)
 
     def live_session(self, url):
         """Ask the process itself which conversation it currently shows.
@@ -386,12 +361,18 @@ def manifest_entries(records):
             continue
         entries.append({
             'session': data.get('session'),
+            # The tmux session id (``$N``). Only a hint for the restore program:
+            # tmux allocates ids per server, so after a reboot it may name
+            # something else. It exists so a session that was renamed but not
+            # restarted can still be found; the name above stays authoritative.
+            'tmux_session_id': data.get('session_id'),
             'window_order': data.get('window_order'),
             'pane_order': data.get('pane_order'),
             'window_index': data.get('window_index'),
             'pane_index': data.get('pane_index'),
             'cwd': data.get('pane_cwd'),
             'window_layout': data.get('window_layout'),
+            # The CodeBuddy conversation id -- unrelated to tmux session ids.
             'session_id': session_id,
             'session_id_source': data.get('conversation_id_source'),
             'pid_file_session_id': data.get('pid_file_session_id'),
@@ -403,13 +384,6 @@ def manifest_entries(records):
 
 def pane_key(entry):
     return entry.get('session'), entry.get('window_order'), entry.get('pane_order')
-
-
-def boot_id():
-    try:
-        return Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip()
-    except OSError:
-        return None
 
 
 def restore_pending(state_dir):
@@ -470,6 +444,20 @@ def load_manifest(path):
     return document
 
 
+def recorded_sockets(path):
+    """Sockets a previous sweep saw, as recorded in the manifest.
+
+    Discovery already covers ``$TMUX_TMPDIR``, ``$TMPDIR`` and ``/tmp``, but a
+    server started over SSH can live under a TMPDIR the current environment does
+    not mention — a launchd job, for instance, does not inherit the login
+    shell's. Retrying what the last sweep found closes that gap.
+    """
+    sockets = load_manifest(path).get('sockets')
+    if not isinstance(sockets, list):
+        return []
+    return [value for value in sockets if isinstance(value, str)]
+
+
 def run(options):
     os.umask(0o077)
     options.state_dir.mkdir(parents=True, exist_ok=True)
@@ -485,7 +473,7 @@ def run(options):
             log.write('run_start', version=VERSION, dry_run=not options.apply,
                       only_sessions=sorted(options.only_session))
             sessions = Sessions(options.codebuddy_home, options.name_source)
-            sockets = discover_sockets(options.socket)
+            sockets = discover_sockets(options.socket, recorded_sockets(options.manifest))
             tree = processes()
             records = []
             for socket in sockets:
@@ -553,8 +541,8 @@ def main():
     options.name_source = options.name_source or config.get('name_source', 'auto')
     options.manifest = Path(options.manifest or config.get('manifest')
                             or options.state_dir / MANIFEST_NAME).expanduser().resolve()
-    if sys.platform != 'linux' or not shutil.which('tmux'):
-        parser.error('Linux with /proc and tmux in PATH is required')
+    if compat.PLATFORM not in ('linux', 'darwin') or not shutil.which('tmux'):
+        parser.error('Linux or macOS with tmux in PATH is required')
     try:
         return run(options)
     except Exception as error:

@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.3.0 — 2026-09-22
+
+macOS 支持，外加三个既有 bug —— 其中两个 Linux 也受影响。
+
+### 新增：macOS
+
+- **进程与启动标识抽成共享模块 `platform_compat.py`。** 此前 `processes()` /
+  `is_codebuddy()` / `boot_id()` 在两个脚本里各有一份拷贝，而 `boot_id()` 的拷贝是**真的
+  会坏事**：restore 把值写进 `last-restore.json`，sync 拿它判断「是不是重启过」，两份实现
+  必须逐字节一致。现在两边直接绑定同一个函数，测试里断言 `sync.boot_id is
+  compat.boot_id`。
+- **Linux 继续走 `/proc`，macOS 走 `ps`/`sysctl`：**
+  `ps -axo pid=,ppid=,lstart=` 取进程树（`lstart` 充当「同一进程实例」的令牌）、
+  `ps -axo pid=,command=` 取命令行、`sysctl -n kern.bootsessionuuid` 取启动标识
+  （依次回退到解析 `kern.boottime`、再回退到 pid 1 的启动时间）。
+- **命令匹配要对付 macOS 的参数边界丢失**：`ps` 把 argv 用空格拼起来，所以只接受
+  「首个 token」或「含 `/` 的 token」的 basename 命中——`node …/bin/codebuddy` 与
+  `/bin/sh /tmp/x/bin/codebuddy` 能匹配，`vim codebuddy` 不会误匹配。
+- **`processes`/`process_commands` 带 TTL 缓存**，因为恢复脚本在轮询；轮询循环改成每轮
+  只读一次进程表，不再是每个候选 pid 一次 `ps`。
+- **systemd → launchd。** 两个 LaunchAgent：`local.tmux-codebuddy-pane-sync.sync`
+  （`RunAtLoad` + `StartInterval`）与 `…​.restore`（`RunAtLoad` + `AbandonProcessGroup`
+  + `--delay-seconds 10`）。`EnvironmentVariables.PATH` 必须显式给出，因为 launchd 默认
+  PATH 不含 `/usr/local/bin`，而 tmux 在那儿。
+- **安装时绝不 bootstrap 恢复 agent。** `RunAtLoad` 会在安装瞬间触发一次恢复，把用户没要的
+  对话全启起来。launchd 每次登录自动加载 `~/Library/LaunchAgents`，正好等价于 systemd 的
+  「enable 但不 start」。测试专门断言这一点。
+- **启动器默认值按平台区分**：Linux `workbuddy`，macOS `codebuddy`，未知平台兜底
+  `codebuddy`。新增 `--launcher-command` / 配置键 `launcher_command`；`--workbuddy-command`
+  与 `workbuddy_command` 作为永久别名保留，已有 `config.json` 不用改。
+- **安装后自检**：`platform_compat.py` 必须与脚本同目录落地，且两个脚本都能 `--help`
+  跑起来（`--help` 会先执行模块级 import，所以在安装时就能发现缺模块，而不是等到登录时才炸）。
+- **`--delay-seconds`** 移进恢复脚本（stdlib、可测），替代 Linux unit 里的
+  `ExecStartPre=/bin/sleep 20`。
+
+### 修复
+
+- **会话名被当作寻址键（Linux 也受影响）。** manifest 记的是 tmux 会话**名**，恢复时按名字
+  下 `-t`。但 tmux 的目标语法是 `session:window.pane`，所以名为 `deepseek4.1_work1` 的会话
+  被解析成 session `deepseek4` + window `1_work1`，每一次寻址都报
+  `can't find window: deepseek4`，恢复直接失败。现在名字只在 Python 侧匹配，只有 `$N` 会
+  进入 `-t`。manifest 新增 `tmux_session_id` 作为**提示**（不是依据——tmux 的 id 由 server
+  分配，重启后会重编）。解析与创建都失败时记 `session_unaddressable` 并跳过，不中断其余恢复。
+- **socket 发现漏了 `$TMPDIR`（macOS 相关）。** 原来只扫 `/tmp` 与 `$TMUX_TMPDIR`。现在按序
+  扫 `$TMUX` → `$TMUX_TMPDIR` → `$TMPDIR` → `/tmp`，按 `resolve()` 去重（`/tmp` 与
+  `/private/tmp` 视为同一个），并把上一轮 manifest 里记录的 socket 并入重试。
+- **`ensure_position` 在「成功但空」的输出上会死循环。** `session_layout` 对空输出返回 `[]`
+  而不是 `None`，原来的 `if layout is None` 判不到，`while len(layout) <= window_order`
+  就会无限建窗口。改成 `if not layout`（真实 session 至少有一个 window 一个 pane）。
+- **两个测试文件里 `unittest.main()` 出现在类定义之前**，导致 `TestBootAwareManifest`
+  （`test_restore.py`）和 `TestPaneOrdinals` / `TestLiveEndpoint` / `TestTitleDisambiguation`
+  （`test_sync.py`）**从未执行过**。修好后用例数从 92 涨到 110。
+- **两处启动顺序断言会随机失败**：并发启动的 pane 谁先写日志是竞态，断言却要求固定顺序。
+  已有同类断言大多用了 `sorted`，漏掉的那两处补齐了。
+- **`test_apply_creates_the_pane_and_resumes_the_conversation` 在 macOS 上比较 cwd 字面量**，
+  而 tmux 报 `/private/var/...`、`mkdtemp` 给 `/var/...`（同一个目录）。改成比较 `resolve()`。
+
+### 说明
+
+- **macOS 上做不到开机恢复。** LaunchAgent 在登录时运行；能开机运行的 LaunchDaemon 以 root
+  待在系统 bootstrap 域里，够不到用户自己的 tmux server（socket 在用户自己的 `TMPDIR` 下）。
+  得到的是**登录即恢复**——好在 tmux server 本身也只存在于登录会话里，两者一致。这是 macOS
+  的模型，不是妥协。
+- 与 `tmux-codex-pane-sync` 保持独立架构：那边**尚未**做同样的移植。
+
 ## 0.2.0 — 2026-09-21
 
 - 新增「记录 + 开机恢复」：把每个 pane 打开的对话写进 `restore-manifest.json`，重启后重建

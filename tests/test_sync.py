@@ -3,6 +3,8 @@
 Integration tests create their own tmux server on a private socket, so existing
 sessions are never touched.
 """
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -12,11 +14,13 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import xml.etree.ElementTree as ElementTree
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import manage  # noqa: E402
+import platform_compat as pc  # noqa: E402
 import tmux_codebuddy_pane_sync as sync  # noqa: E402
 
 TMUX = shutil.which('tmux')
@@ -268,6 +272,221 @@ class TestSynchronize(unittest.TestCase):
             self.assertEqual(sync.synchronize(self.data(), self.sessions, True)[0], 'verification_mismatch')
 
 
+def _plist_value(text, key):
+    """The value node following ``key`` in a rendered plist."""
+    root = ElementTree.fromstring(text)
+    children = list(root.find('dict'))
+    for index, node in enumerate(children):
+        if node.tag == 'key' and node.text == key:
+            return children[index + 1]
+    return None
+
+
+class TestLaunchdPlist(unittest.TestCase):
+    """The macOS backend's renderer. Pure, so launchd is never involved."""
+
+    def render(self, **overrides):
+        options = dict(label='local.x.sync', arguments=['/usr/bin/python3', '/x/y.py'],
+                       environment={'PATH': '/usr/local/bin:/usr/bin'},
+                       logs_dir=Path('/tmp/logs'), interval_seconds=1800,
+                       abandon_process_group=False)
+        options.update(overrides)
+        return manage.plist_document(**options)
+
+    def test_the_document_is_valid_xml(self):
+        self.assertEqual(ElementTree.fromstring(self.render()).tag, 'plist')
+
+    def test_label_and_program_arguments_round_trip(self):
+        text = self.render(arguments=['/usr/bin/python3', '/x/y.py', '--apply'])
+        self.assertEqual(_plist_value(text, 'Label').text, 'local.x.sync')
+        arguments = _plist_value(text, 'ProgramArguments')
+        self.assertEqual([node.text for node in arguments], ['/usr/bin/python3', '/x/y.py', '--apply'])
+
+    def test_run_at_load_is_set(self):
+        self.assertEqual(_plist_value(self.render(), 'RunAtLoad').tag, 'true')
+
+    def test_the_interval_is_in_seconds(self):
+        self.assertEqual(_plist_value(self.render(interval_seconds=1800), 'StartInterval').text, '1800')
+
+    def test_an_absent_interval_omits_the_key(self):
+        self.assertIsNone(_plist_value(self.render(interval_seconds=None), 'StartInterval'))
+
+    def test_abandon_process_group_is_opt_in(self):
+        self.assertIsNone(_plist_value(self.render(), 'AbandonProcessGroup'))
+        self.assertEqual(_plist_value(self.render(abandon_process_group=True),
+                                      'AbandonProcessGroup').tag, 'true')
+
+    def test_the_path_is_carried_explicitly(self):
+        """launchd's default PATH omits /usr/local/bin, which is where tmux is."""
+        node = _plist_value(self.render(), 'EnvironmentVariables')
+        pairs = list(node)
+        values = {pairs[i].text: pairs[i + 1].text for i in range(0, len(pairs), 2)}
+        self.assertEqual(values, {'PATH': '/usr/local/bin:/usr/bin'})
+
+    def test_log_paths_are_derived_from_the_label(self):
+        text = self.render(label='local.x.restore')
+        self.assertEqual(_plist_value(text, 'StandardOutPath').text, '/tmp/logs/local.x.restore.out.log')
+        self.assertEqual(_plist_value(text, 'StandardErrorPath').text, '/tmp/logs/local.x.restore.err.log')
+
+    def test_xml_special_characters_are_escaped(self):
+        text = self.render(arguments=['--name', 'a&b<c>"d"'])
+        self.assertEqual([node.text for node in _plist_value(text, 'ProgramArguments')],
+                         ['--name', 'a&b<c>"d"'])
+
+
+class TestLaunchctl(unittest.TestCase):
+    def test_bootstrap_boots_out_first(self):
+        calls = []
+
+        def fake(*args, **kwargs):
+            calls.append(args)
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(manage, 'launchctl', fake):
+            self.assertTrue(manage.bootstrap_agent(Path('/tmp/x.plist'), 'local.x'))
+        domain = f'gui/{os.getuid()}'
+        self.assertEqual(calls[0], ('bootout', f'{domain}/local.x'))
+        self.assertEqual(calls[1], ('bootstrap', domain, '/tmp/x.plist'))
+
+    def test_bootstrap_retries_once_after_a_transient_refusal(self):
+        results = [1, 0]
+        calls = []
+
+        def fake(*args, **kwargs):
+            calls.append(args)
+            if args[0] == 'bootstrap':
+                return mock.Mock(returncode=results.pop(0))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(manage, 'launchctl', fake):
+            self.assertTrue(manage.bootstrap_agent(Path('/tmp/x.plist'), 'local.x'))
+        self.assertEqual([call[0] for call in calls],
+                         ['bootout', 'bootstrap', 'bootout', 'bootstrap'])
+
+    def test_bootstrap_reports_persistent_failure(self):
+        with mock.patch.object(manage, 'launchctl', lambda *a, **k: mock.Mock(returncode=1)):
+            self.assertFalse(manage.bootstrap_agent(Path('/tmp/x.plist'), 'local.x'))
+
+    def test_deactivate_boots_out_both_agents(self):
+        calls = []
+        with mock.patch.object(manage, 'launchctl',
+                               lambda *a, **k: (calls.append(a), mock.Mock(returncode=0))[1]), \
+                mock.patch.object(manage.compat, 'PLATFORM', 'darwin'):
+            manage.deactivate(mock.Mock())
+        domain = f'gui/{os.getuid()}'
+        self.assertEqual([call[1] for call in calls],
+                         [f'{domain}/{manage.SYNC_LABEL}', f'{domain}/{manage.RESTORE_LABEL}'])
+
+
+class TestInstallOnMacOS(unittest.TestCase):
+    """install() must write the plists and never bootstrap the restore agent.
+
+    RunAtLoad on the restore agent would fire a restore during install, which
+    would start conversations the user did not ask for.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.home = self.tmp / 'home'
+        (self.home / '.local/bin').mkdir(parents=True)
+        tmux_dir = self.tmp / 'bin'
+        tmux_dir.mkdir()
+        self.tmux = tmux_dir / 'tmux'
+        self.tmux.write_text('#!/bin/sh\n', encoding='utf-8')
+        self.tmux.chmod(0o700)
+        self.calls = []
+
+        def fake_launchctl(*args, **kwargs):
+            self.calls.append(args)
+            return mock.Mock(returncode=0)
+
+        self.patches = [
+            mock.patch.object(Path, 'home', return_value=self.home),
+            mock.patch.object(manage, 'launchctl', fake_launchctl),
+            mock.patch.object(manage.compat, 'PLATFORM', 'darwin'),
+            mock.patch.object(manage.shutil, 'which', return_value=str(self.tmux)),
+            mock.patch.dict(os.environ, {'XDG_STATE_HOME': str(self.tmp / 'state'),
+                                         'XDG_CONFIG_HOME': str(self.tmp / 'config')}),
+        ]
+        for patch in self.patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def args(self, **overrides):
+        values = dict(interval_minutes=None, codebuddy_home=None, state_dir=None,
+                      socket=None, name_source=None, launcher_command=None,
+                      workbuddy_command=None, restore_layout=None, stagger_seconds=None,
+                      no_hook=True, no_restore=False, no_start=False)
+        values.update(overrides)
+        return mock.Mock(**values)
+
+    def install(self, **overrides):
+        layout = manage.Layout({}, None)
+        # install() prints a summary; keep it out of the test output.
+        with contextlib.redirect_stdout(io.StringIO()):
+            manage.install(self.args(**overrides), layout)
+        return layout
+
+    def test_the_plists_are_written_with_the_right_interval(self):
+        layout = self.install(interval_minutes=45)
+        self.assertTrue(layout.sync_agent.is_file())
+        self.assertTrue(layout.restore_agent.is_file())
+        text = layout.sync_agent.read_text(encoding='utf-8')
+        self.assertEqual(_plist_value(text, 'StartInterval').text, str(45 * 60))
+
+    def test_the_restore_agent_is_never_bootstrapped(self):
+        layout = self.install()
+        bootstrapped = [call[2] for call in self.calls if call[0] == 'bootstrap']
+        self.assertEqual(bootstrapped, [str(layout.sync_agent)])
+
+    def test_the_restore_agent_passes_a_delay(self):
+        layout = self.install()
+        arguments = [node.text for node in _plist_value(
+            layout.restore_agent.read_text(encoding='utf-8'), 'ProgramArguments')]
+        self.assertIn('--delay-seconds', arguments)
+        self.assertEqual(arguments[arguments.index('--delay-seconds') + 1],
+                         str(manage.RESTORE_DELAY_SECONDS))
+
+    def test_the_shared_module_is_installed_beside_the_scripts(self):
+        layout = self.install()
+        self.assertTrue(layout.platform_module.is_file())
+        self.assertEqual(layout.platform_module.read_bytes(),
+                         (manage.ROOT / 'platform_compat.py').read_bytes())
+
+    def test_the_installed_scripts_actually_run(self):
+        """verify_installed_scripts is exercised for real, not stubbed."""
+        layout = self.install()
+        self.assertTrue(layout.script.is_file())
+        self.assertTrue(layout.restore_script.is_file())
+
+    def test_a_missing_shared_module_fails_the_install(self):
+        """Proven in two parts, to avoid patching shutil.copyfile globally."""
+        with mock.patch.object(manage, 'verify_installed_scripts') as verify:
+            self.install()
+        verify.assert_called_once()
+
+        layout = self.install()
+        layout.platform_module.unlink()
+        with self.assertRaises(SystemExit) as caught:
+            manage.verify_installed_scripts(layout, str(Path(sys.executable).resolve()))
+        self.assertIn('platform_compat.py', str(caught.exception))
+
+    def test_no_restore_omits_the_restore_agent(self):
+        layout = self.install(no_restore=True)
+        self.assertFalse(layout.restore_agent.exists())
+        self.assertTrue(layout.sync_agent.exists())
+
+    def test_uninstall_removes_the_plists_but_keeps_the_config(self):
+        layout = self.install()
+        manage.uninstall(layout, no_start=False)
+        self.assertFalse(layout.sync_agent.exists())
+        self.assertFalse(layout.restore_agent.exists())
+        self.assertFalse(layout.script.exists())
+        self.assertFalse(layout.platform_module.exists())
+        self.assertTrue(layout.config_file.exists(), 'configuration is retained')
+
+
 class TestHookRegistration(unittest.TestCase):
     """Mirrors the real settings.json: the turn hook lives on both events."""
 
@@ -446,9 +665,14 @@ class TestEndToEnd(unittest.TestCase):
         binary.chmod(0o700)
         self.tmux('send-keys', '-t', '%0', str(binary), 'Enter')
         pane_pid = int(self.tmux('display-message', '-p', '-t', '%0', '#{pane_pid}'))
+        # Found through the shared platform layer rather than /proc, so this
+        # works on macOS too. The last argv token is compared after resolving,
+        # because macOS reports /private/var/... where mkdtemp said /var/...
+        target = binary.resolve()
         for _ in range(100):
-            children = [int(p.name) for p in Path('/proc').glob('[0-9]*')
-                        if self.cmdline(p) == f'/bin/sh {binary}']
+            children = [pid for pid, command in pc.process_commands().items()
+                        if command and Path(command.split()[-1]).resolve() == target
+                        and len(command.split()) == 2]
             if children:
                 pid = children[0]
                 (self.home / 'sessions' / f'{pid}.json').write_text(json.dumps(
@@ -462,11 +686,8 @@ class TestEndToEnd(unittest.TestCase):
 
     @staticmethod
     def cmdline(pid):
-        try:
-            return ' '.join(os.fsdecode(a) for a in
-                            (Path('/proc') / str(pid) / 'cmdline').read_bytes().split(b'\0')).strip()
-        except OSError:
-            return ''
+        """Command line of a pid, via the shared platform layer."""
+        return pc.process_commands().get(int(pid), '')
 
     def write_transcript(self, custom=None, ai=None):
         rows = [{'type': 'message', 'role': 'user', 'content': 'hi'}]
@@ -583,10 +804,6 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn('Another synchronization is running', result.stdout)
         self.assertFalse((self.state / 'pane-names.jsonl').exists())
-
-
-if __name__ == '__main__':
-    unittest.main()
 
 
 class TestPaneOrdinals(unittest.TestCase):
@@ -729,3 +946,7 @@ class TestTitleDisambiguation(SessionsTestCase):
             info, reason = self.sessions.inspect(10, self.TREE, 'something else')
         self.assertIsNone(info)
         self.assertEqual(reason, 'ambiguous_sessions')
+
+
+if __name__ == '__main__':
+    unittest.main()

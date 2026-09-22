@@ -7,7 +7,8 @@ update — every 30 minutes, plus once at the end of every turn.**
 
 It also records **which conversation each pane has open**, so after a reboot the tmux
 sessions, windows and panes are rebuilt and every pane runs
-`workbuddy -r <session-id>` to bring back the *same* conversation rather than a new one.
+`<launcher> -r <session-id>` to bring back the *same* conversation rather than a new one.
+The launcher defaults to `workbuddy` on Linux and `codebuddy` on macOS.
 
 Built for people running several CodeBuddy CLI sessions at once, so panes read
 `公司法了解` or `全球同步-Windterm` instead of an interchangeable label.
@@ -29,8 +30,7 @@ Sibling project: [tmux-codex-pane-sync](https://github.com/PukerWonderLand/tmux-
 
 ## Install
 
-On the **Linux server that runs tmux and the CodeBuddy CLI**, as the user who owns
-them:
+On the **machine that runs tmux and the CodeBuddy CLI**, as the user who owns them:
 
 ```
 git clone https://github.com/PukerWonderLand/tmux-codebuddy-pane-sync.git
@@ -38,14 +38,34 @@ cd tmux-codebuddy-pane-sync
 ./install.sh
 ```
 
-The installer backs up any previous installation, installs a per-user systemd
-service and timer, **appends** two hooks to `settings.json`, syncs once
-immediately, and then runs every 30 minutes.
+The installer backs up any previous installation, installs a per-user periodic
+service, **appends** two hooks to `settings.json`, syncs once immediately, and then
+runs every 30 minutes.
 
 **No sudo, no pip, no API key, and no model requests.** Standard library only.
 
-Requires Linux, Python **3.9+**, tmux, and a working systemd user manager. Running
-the script directly needs no systemd.
+Requires **Linux or macOS**, Python **3.9+**, and tmux. The periodic service uses a
+systemd user manager on Linux and a LaunchAgent on macOS; running the script directly
+needs neither.
+
+### The one real difference between the platforms
+
+| | Linux | macOS |
+|:--|:--|:--|
+| Periodic backstop | systemd user timer | LaunchAgent (`StartInterval`) |
+| When a restore runs | **at boot** (`WantedBy=default.target`) | **at login** (`RunAtLoad`) |
+| Where the units live | `~/.config/systemd/user/` | `~/Library/LaunchAgents/` |
+
+**A true boot-time restore is not achievable on macOS.** A LaunchAgent runs at login. A
+LaunchDaemon could run at boot, but it lives in the system bootstrap namespace as root
+and therefore **cannot reach the user's tmux server** — that socket sits in the user's
+own `TMPDIR`. So macOS gets *restore at login*.
+
+That is not a fudge: the tmux server itself only exists for the duration of a login
+session, so the two coincide. The restore agent is loaded by launchd at your **next
+login** and is deliberately *not* bootstrapped during install — `RunAtLoad` would
+otherwise fire a restore the moment you installed, starting conversations you never
+asked for.
 
 ```
 # Preview what would change; rename nothing
@@ -60,7 +80,7 @@ python3 tmux_codebuddy_pane_sync.py --apply
 | Trigger | When | Why |
 |---|---|---|
 | CodeBuddy hook | every `UserPromptSubmit` / `Stop` | a `/rename` or a fresh title lands **as the turn ends**; only the current session is touched |
-| systemd timer | every 30 minutes by default | backstop, and covers CodeBuddy writing its own title back |
+| periodic job | every 30 minutes by default | backstop, and covers CodeBuddy writing its own title back |
 
 `install.sh` appends the hooks to `~/.codebuddy/settings.json` and **never edits or
 removes** hooks you already have (such as a usage/archive hook). Uninstall removes
@@ -75,16 +95,34 @@ exactly what it added.
 ## Restoring conversations after a reboot
 
 Every full sweep writes "which pane holds which conversation" to
-`~/.local/state/tmux-codebuddy-pane-sync/restore-manifest.json`. After a reboot
-`tmux-codebuddy-pane-sync-restore.service` (`WantedBy=default.target`; your `Linger=yes`
-means no login is needed) starts the tmux server, rebuilds the missing
-sessions/windows/panes, and for each pane checks **whether CodeBuddy already runs there**
-(skip if so, never interrupt) before sending
-`tmux send-keys "cd <cwd> && workbuddy -r <id>"`.
+`~/.local/state/tmux-codebuddy-pane-sync/restore-manifest.json`:
+
+```json
+{"version": 1, "captured_at": "2026-09-21T15:21:20+08:00",
+ "panes": [{"session": "deepseek4_1_work5", "tmux_session_id": "$3",
+            "window_order": 0, "pane_order": 2,
+            "cwd": "/home/codex", "session_id": "01a09eb5-f596-7494-...",
+            "session_id_source": "endpoint", "title": "TMU的pane自动更新"}]}
+```
+
+`session` is the tmux session **name**, `session_id` is the **CodeBuddy conversation
+id** (unrelated), and `tmux_session_id` is tmux's `$N`. On restore the name is matched
+in Python and **only `$N` is ever handed to tmux as a target** — tmux's target syntax
+is `session:window.pane`, so a session literally named `deepseek4.1_work1` would parse
+as session `deepseek4`, window `1_work1`, and every name-based lookup would fail.
+`tmux_session_id` is only a hint: tmux allocates ids per server, so after a reboot it
+usually names something else, which is why the name stays authoritative.
+
+The restore runs from a service — `tmux-codebuddy-pane-sync-restore.service` on Linux
+(`WantedBy=default.target`; your `Linger=yes` means no login is needed), or
+`~/Library/LaunchAgents/local.tmux-codebuddy-pane-sync.restore.plist` on macOS (at
+login). It starts the tmux server, rebuilds the missing sessions/windows/panes, and for
+each pane checks **whether CodeBuddy already runs there** (skip if so, never interrupt)
+before sending `tmux send-keys "cd <cwd> && <launcher> -r <id>"`.
 
 ```
 codebuddy_restore.py --dry-run                                    # plan only, changes nothing
-codebuddy_restore.py --apply                                      # what the boot service runs
+codebuddy_restore.py --apply                                      # what the restore service runs
 codebuddy_restore.py --apply --only-tmux-session deepseek4_1_work5 # narrow test
 ```
 
@@ -144,8 +182,11 @@ overridden at install time.
 | Restore manifest | `~/.local/state/tmux-codebuddy-pane-sync/restore-manifest.json` |
 | Restore log | `~/.local/state/tmux-codebuddy-pane-sync/restore-log.jsonl` |
 | Previous install backups | `~/.local/state/tmux-codebuddy-pane-sync/install-backups/` |
-| systemd units | `~/.config/systemd/user/tmux-codebuddy-pane-sync.{service,timer}` |
-| Boot restore unit | `~/.config/systemd/user/tmux-codebuddy-pane-sync-restore.service` |
+| shared module | `~/.local/bin/platform_compat.py` |
+| systemd units (Linux) | `~/.config/systemd/user/tmux-codebuddy-pane-sync.{service,timer}` |
+| Boot restore unit (Linux) | `~/.config/systemd/user/tmux-codebuddy-pane-sync-restore.service` |
+| LaunchAgents (macOS) | `~/Library/LaunchAgents/local.tmux-codebuddy-pane-sync.{sync,restore}.plist` |
+| service logs (macOS) | `~/Library/Logs/tmux-codebuddy-pane-sync/` |
 
 The log is JSONL, one JSON object per line, with time, run id, socket, session,
 pane id, CodeBuddy conversation id, previous title, conversation name and result.
@@ -182,37 +223,59 @@ or deleted automatically.
 ./install.sh --no-hook               # timer only; settings.json untouched
 ./install.sh --socket /path/to/tmux.sock --socket /another/tmux.sock
 ./install.sh --no-restore                                            # titles only
-./install.sh --workbuddy-command /home/codex/.local/bin/workbuddy --stagger-seconds 3
+./install.sh --launcher-command /home/codex/.local/bin/workbuddy --stagger-seconds 3
 ```
 
-Without explicit sockets, the tool discovers `/tmp/tmux-UID/*`, sockets under
-`TMUX_TMPDIR`, and the socket `TMUX` points at. systemd does not always inherit an
-interactive shell's environment, so pin non-standard locations with `--socket`.
-Only sockets owned by the current user are used.
+Without explicit sockets, the tool discovers, in order, the socket `TMUX` points at,
+sockets under `$TMUX_TMPDIR` and `$TMPDIR`, and `/tmp/tmux-UID/*` — deduplicated by
+`resolve()`, so `/tmp` and `/private/tmp` count once. Sockets recorded in the previous
+manifest are retried as well, because a tmux server started over SSH can have a
+different `TMPDIR` from a background job. A service manager does not always inherit an
+interactive shell's environment, so pin non-standard locations with `--socket`. Only
+sockets owned by the current user are used.
 
 Reinstalling keeps the previous interval, data paths, sockets and `name_source`.
-Change the interval by reinstalling, since the timer is regenerated. `--no-start`
-writes files without calling systemd. Without systemd, schedule
-`python3 tmux_codebuddy_pane_sync.py --apply` yourself.
+Change the interval by reinstalling, since the periodic unit is regenerated.
+`--no-start` writes files without calling the service manager. Without systemd or
+launchd, schedule `python3 tmux_codebuddy_pane_sync.py --apply` yourself.
+
+The flag and config key are named after `workbuddy` because that was the only CLI this
+followed. `--launcher-command` / `launcher_command` supersede them; the old spellings
+remain as permanent aliases so an existing `config.json` never needs editing.
 
 ### SSH logout and reboot
 
-The user timer is enabled and starts with the user's systemd manager. To keep it
-running with no login session:
+**Linux:** the user timer starts with the user's systemd manager. To keep it running
+with no login session:
 
 ```
 loginctl show-user "$USER" -p Linger
 ```
 
 If that is `no`, consider `loginctl enable-linger "$USER"` (needs admin rights on
-some systems). This tool never changes linger. tmux sessions are not restored after
-a reboot, and only panes that exist at that moment are handled.
+some systems). This tool never changes linger.
+
+**macOS:** a LaunchAgent exists only while you are logged in, which matches the tmux
+server's own lifetime. To inspect it:
+
+```
+launchctl print "gui/$(id -u)/local.tmux-codebuddy-pane-sync.sync"
+tail -n 30 ~/Library/Logs/tmux-codebuddy-pane-sync/local.tmux-codebuddy-pane-sync.sync.err.log
+```
+
+This tool does **not** resurrect pre-reboot tmux sessions; it only handles the panes
+that exist when it runs — which is what the manifest and the restore service are for.
 
 ### Stopping and uninstalling
 
 ```
-systemctl --user disable --now tmux-codebuddy-pane-sync.timer   # pause
-systemctl --user enable --now tmux-codebuddy-pane-sync.timer    # resume
+# pause / resume the periodic job (Linux)
+systemctl --user disable --now tmux-codebuddy-pane-sync.timer
+systemctl --user enable --now tmux-codebuddy-pane-sync.timer
+
+# pause it (macOS)
+launchctl bootout "gui/$(id -u)/local.tmux-codebuddy-pane-sync.sync"
+
 ./uninstall.sh                                                  # remove code, keep logs
 ```
 
@@ -233,8 +296,11 @@ is left alone, and reinstalling is idempotent.
 
 ## Compatibility and limits
 
-- Needs Linux `/proc`; not a native Windows/macOS installer. Usable inside WSL's
-  Linux environment, subject to tmux, process visibility and systemd.
+- **Linux and macOS are both supported.** Linux reads the process table from `/proc`;
+  macOS uses `ps -axo pid=,ppid=,lstart=`. The default launcher differs by platform
+  (`workbuddy` / `codebuddy`). Windows is not a native target; use WSL's Linux
+  environment.
+- **macOS can only restore at login, never at boot** — see the table in *Install*.
 - Associates panes via `~/.codebuddy/sessions/<pid>.json`. CodeBuddy does **not**
   hold its transcript open, so this project does not scan `/proc/PID/fd` — the
   approach used by `tmux-codex-pane-sync` finds nothing on CodeBuddy.
@@ -253,39 +319,38 @@ is left alone, and reinstalling is idempotent.
 - tmux 3.2a has no `allow-set-title`; this project does not rely on it.
 - Only tmux servers owned and reachable by the current user are scanned.
 - Fully independent of `tmux-codex-pane-sync`: different app name, config
-  directory, journal and systemd units, so both can be installed at once.
-
-About restoring:
-
-- **The layout is recorded as order, not as tmux indexes.** Measured: `window_index` and
-  `pane_index` drift as windows and panes come and go (`6/13` became `0/0` within minutes),
-  so the manifest stores each window's position in its session and each pane's position in
-  its window. Restored indexes may differ, but the window count, the pane count per window,
-  and which conversation sits where are preserved.
-- `/api/v1/sessions/live` is marked **Beta** upstream and its fields may change; if the
-  endpoint is unreachable the tool falls back to `sessions/<pid>.json` (which points at the
-  wrong session after a `/resume`, which is why the endpoint is authoritative).
-- **Record before you reboot**: the endpoint port is per-process, so it necessarily changes
-  across a reboot and cannot be queried afterwards. The manifest is refreshed every 30
-  minutes and at the end of every turn.
-- `kind=bg` background sessions live outside panes and are not restored.
-- A restore really types `workbuddy -r <id>` into panes: a missing cwd is skipped
-  (`missing_cwd`) and a pane already running CodeBuddy is never touched.
+  directory, journal and service units, so both can be installed at once.
+- **Session names may contain `.` or `:`** — both are tmux target separators, which
+  is why addressing by name used to fail. Names are now matched in Python and only
+  tmux's `$N` is ever used as a target. A session that can neither be resolved nor
+  created is reported as `session_unaddressable` and skipped; the rest of the restore
+  continues.
 
 ## Development
 
 Standard library only, no third-party runtime dependency:
 
 ```
-python3 -m unittest discover -s tests -v
+python3 tests/test_platform_compat.py
+python3 tests/test_sync.py
+python3 tests/test_restore.py
 ```
 
 Tests use temporary directories and an **isolated tmux socket**, and never touch
-existing sessions. They cover custom-title precedence, `aiTitle` fallback, status
-glyph stripping (anti-ping-pong), `#` escaping, control characters, backup failure
-blocking renames, session uniqueness, identity changes, shared panes, hook
-registration idempotency and uninstall preservation, and `--only-session` writing
-nothing for unrelated panes. GitHub Actions runs Python 3.9 and 3.12.
+existing sessions. The cases that would write to `~/Library/LaunchAgents` or
+`~/.codebuddy` redirect those paths into a temp directory instead of touching the real
+ones, and platform branches are driven by patching `platform_compat.PLATFORM`, so all
+three OS code paths are exercised on any host.
+
+They cover custom-title precedence, `aiTitle` fallback, status glyph stripping
+(anti-ping-pong), `#` escaping, control characters, backup failure blocking renames,
+session uniqueness, identity changes, shared panes, hook registration idempotency and
+uninstall preservation, `--only-session` writing nothing for unrelated panes,
+`ps`/`sysctl` output parsing, command-token matching in both directions,
+socket-candidate deduplication, restoring a session whose name contains `.` or `:`,
+manifest backward compatibility, plist rendering and `launchctl` arguments, and
+"install must never bootstrap the restore agent". GitHub Actions runs Python 3.9 and
+3.12.
 
 Issues and PRs welcome. When reporting a reproduction, use invented conversation
 names instead of attaching personal logs or CodeBuddy data.
